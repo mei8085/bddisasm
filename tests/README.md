@@ -51,3 +51,17 @@ Each entry in the configuration file has the following structure:
 ```
 
 NOTE: The paths in the configuration file are relative to it.
+# Operand access-graph tests
+
+The `access/` directory holds a separate, self-contained suite that checks the **read/write**
+semantics of each decoded instruction rather than the text form: explicit operand accesses,
+implicit accesses (`RSP`, `SS`, addressing registers, flags, RIP, shadow stack) and the
+`NdGetFullAccessMap` view. It has its own minimal-encoding sample table, per-bit flag
+expectations and a structural invariant sweep over the opcode space. It needs only a C11
+compiler and `libbddisasm.a` - no `disasmtool` and no Python.
+
+See [access/README.md](access/README.md) for the expectation syntax and the run instructions:
+
+```
+$ ./access/run_tests.sh
+```

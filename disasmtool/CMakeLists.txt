@@ -26,11 +26,20 @@ target_link_libraries(disasmtool PRIVATE bddisasm::bddisasm bddisasm::bdshemu)
 
 # Add tests target.
 if (BDD_INCLUDE_TESTS)
+    # Operand access-graph integration tests. They link the library directly (no disasmtool), so
+    # they also run for a no-mnemonic build where the textual result files cannot be produced.
+    add_executable(access_graph_test
+        ${CMAKE_SOURCE_DIR}/tests/access/access_graph.c
+        ${CMAKE_SOURCE_DIR}/tests/access/access_graph_test.c)
+    target_link_libraries(access_graph_test PRIVATE bddisasm::bddisasm)
+    target_compile_options(access_graph_test PRIVATE -Wall -Wextra)
+
     add_custom_target(test ALL
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/main.py --conf ${CMAKE_SOURCE_DIR}/bddisasm_test/conf-x86.json --disasm $<TARGET_FILE:disasmtool>
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/main.py --conf ${CMAKE_SOURCE_DIR}/bdshemu_test/conf-x86.json --disasm $<TARGET_FILE:disasmtool>
-        DEPENDS disasmtool
-        COMMENT "Runs decoder and emulator tests"
+        COMMAND $<TARGET_FILE:access_graph_test>
+        DEPENDS disasmtool access_graph_test
+        COMMENT "Runs decoder, emulator and access-graph tests"
     )
 endif ()
 
