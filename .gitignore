@@ -75,3 +75,6 @@ bindings/pybddisasm/pybddisasm/pybddisasm_wrap.c
 
 bddfuzz.tar
 bindings/pybddisasm/.eggs
+
+# x86 decode integration test build/report output
+tests/x86_decode_fuzz/out/

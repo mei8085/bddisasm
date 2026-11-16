@@ -4,6 +4,7 @@ option(BDD_INCLUDE_TOOL "Include the disasmtool executable" ON)
 option(BDD_INCLUDE_ISAGENERATOR_X86 "Include the x86 isagenerator target (if a python interpreter is found)" ON)
 option(BDD_INCLUDE_TESTS "Include decoder & emulator tests" OFF)
 option(BDD_INCLUDE_FUZZERS "Include the bdshemu fuzzer" OFF)
+option(BDD_INCLUDE_DECODE_TESTS "Include the x86 decoder integration tests" OFF)
 option(BDD_USE_EXTERNAL_VSNPRINTF "Expect nd_vsnprintf_s implementation from the integrator" OFF)
 option(BDD_USE_EXTERNAL_MEMSET "Expect nd_memset implementation from the integrator" OFF)
 option(BDD_NO_MNEMONIC "Exclude mnemonics - this option involves setting the BDDISASM_NO_FORMAT flag" OFF)
@@ -261,6 +262,12 @@ endif ()
 
 if ((${CMAKE_PROJECT_NAME} STREQUAL ${PROJECT_NAME}) AND BDD_INCLUDE_FUZZERS)
     add_subdirectory(bdshemu_fuzz)
+endif ()
+
+# x86 decoder integration tests (exact-window decoder checks under sanitizers).
+if ((${CMAKE_PROJECT_NAME} STREQUAL ${PROJECT_NAME}) AND BDD_INCLUDE_DECODE_TESTS)
+    enable_testing()
+    add_subdirectory(tests/x86_decode_fuzz)
 endif ()
 
 # If this is the master project add install and package targets.
