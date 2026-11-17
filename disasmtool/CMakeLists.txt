@@ -26,11 +26,18 @@ target_link_libraries(disasmtool PRIVATE bddisasm::bddisasm bddisasm::bdshemu)
 
 # Add tests target.
 if (BDD_INCLUDE_TESTS)
+    # Decode-to-text boundary tests. They link the library directly (no disasmtool), so they also run for
+    # builds where the textual result files cannot be produced.
+    add_executable(text_boundary_test ${CMAKE_SOURCE_DIR}/tests/text_boundary/text_boundary_test.c)
+    target_link_libraries(text_boundary_test PRIVATE bddisasm::bddisasm)
+    target_compile_options(text_boundary_test PRIVATE -Wall -Wextra -Wno-unused-function)
+
     add_custom_target(test ALL
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/main.py --conf ${CMAKE_SOURCE_DIR}/bddisasm_test/conf-x86.json --disasm $<TARGET_FILE:disasmtool>
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/main.py --conf ${CMAKE_SOURCE_DIR}/bdshemu_test/conf-x86.json --disasm $<TARGET_FILE:disasmtool>
-        DEPENDS disasmtool
-        COMMENT "Runs decoder and emulator tests"
+        COMMAND $<TARGET_FILE:text_boundary_test>
+        DEPENDS disasmtool text_boundary_test
+        COMMENT "Runs decoder, emulator and decode-to-text boundary tests"
     )
 endif ()
 

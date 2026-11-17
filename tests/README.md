@@ -51,3 +51,17 @@ Each entry in the configuration file has the following structure:
 ```
 
 NOTE: The paths in the configuration file are relative to it.
+
+# Decode-to-text boundary tests
+
+The `text_boundary/` directory holds a self-contained suite that checks what happens at the seam between
+decoding and rendering: that a failed decode never leaves a plausible-looking instruction behind, that
+truncated output is reported instead of silently produced, that malformed `INSTRUX` structures are rejected
+by the formatter, and that hardening those paths does not change the text of valid instructions. It needs
+only a C11 compiler and `libbddisasm.a` - no `disasmtool` and no Python.
+
+See [text_boundary/README.md](text_boundary/README.md) for details and the run instructions:
+
+```
+$ ./text_boundary/run_tests.sh
+```

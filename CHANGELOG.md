@@ -4,6 +4,31 @@ All notable (user-facing) changes to this project will be documented in this fil
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Fixed
+- Decoding and operand parsing no longer read past the 15-byte architectural limit when the caller supplied a
+  larger buffer, and never read past the caller's window when `ND_OPTION_SKIP_CACHE_IBYTES` is used.
+- A failed decode now clears the instruction identity (class, definition, operand counts, metadata and
+  mnemonic) instead of leaving the previous instruction in place when `ND_OPTION_SKIP_ZERO_INSTRUX` is used.
+  `Length` is still reported as the boundary reached before the failure.
+- A decode that exhausts the caller's 15-byte window is reported as `ND_STATUS_BUFFER_TOO_SMALL`, while one
+  that genuinely exceeds 15 bytes is reported as `ND_STATUS_INSTRUCTION_TOO_LONG`.
+- `NdToText` / `NdToTextMini` now reject a malformed or stale `INSTRUX` with `ND_STATUS_INVALID_INSTRUX`
+  instead of dereferencing a missing definition, reading past `Operands[]`, or silently dropping an operand it
+  has no name for.
+- `NdToText` / `NdToTextMini` leave the output buffer empty on any failure, so a truncated render is never
+  mistaken for a complete instruction. Truncation is reported as `ND_STATUS_BUFFER_OVERFLOW` for any positive
+  buffer size (previously sizes below `ND_MIN_BUF_SIZE` were rejected as an invalid argument).
+- Fixed an out-of-bounds read of the legacy 8-bit register name table when formatting an 8-bit GPR numbered
+  8..15 in an instruction without REX/REX2, and a stale-value leak when formatting an immediate with an
+  unsupported width.
+
+### Added
+- `tests/text_boundary/`: self-contained decode-to-text boundary tests (decode contract, window semantics,
+  text contract, malformed-structure rejection, and golden text), wired into the CMake `test` target.
+
+
 ## [3.1.2] - 2026-11-03
 
 ### Changed

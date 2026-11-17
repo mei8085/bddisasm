@@ -122,6 +122,27 @@ NdGetVersion(
 
 
 //
+// NdInvalidateInstruxMini
+//
+// Called on every failed decode path. It removes everything that could make the output look like a valid
+// instruction (instruction identity and operand counts), while preserving the boundary information that is
+// still useful to the caller: the status code carries the failure reason, and Length carries how far the
+// decoder got inside the input window. This matters when the caller uses ND_OPTION_SKIP_ZERO_INSTRUX and the
+// structure still holds the previous, valid instruction.
+//
+static void
+NdInvalidateInstruxMini(
+    INSTRUX_MINI *Instrux
+)
+{
+    Instrux->Instruction = (ND_INS_CLASS)ND_INS_INVALID;
+    Instrux->Idbe = 0;
+    Instrux->ExpOperandsCount = 0;
+    Instrux->OperandsCount = 0;
+}
+
+
+//
 // NdIncrementLength
 //
 static inline
@@ -2610,10 +2631,13 @@ NdCopyInstructionInfo(
 
 
 //
-// NdDecodeInternal
+// NdDecodeInternalWorker
+//
+// The actual decode. "Size" is already clamped to the architectural maximum, so every fetch below is
+// bounded to [0, 15) and the caller-provided "Code" buffer is never read beyond one instruction.
 //
 static NDSTATUS
-NdDecodeInternal(
+NdDecodeInternalWorker(
     ND_INTERNAL_CONTEXT *Ictx,
     const ND_UINT8 *Code,
     ND_SIZET Size
@@ -2621,6 +2645,15 @@ NdDecodeInternal(
 {
     NDSTATUS status = ND_STATUS_SUCCESS;
     PND_IDBE pIns = ND_NULL;
+
+    // No instruction can consume more than 15 bytes. "Size" has already been clamped to
+    // ND_MAX_INSTRUCTION_LENGTH by NdDecodeInternal, so no read below can cross the architectural limit.
+
+    // Length and OpLength are the fields this decode accumulates. Reset them unconditionally, even when
+    // the caller asked us not to zero the structure: a caller that reuses an INSTRUX must still see the
+    // boundary of *this* decode, not a value carried over from the previous one.
+    Ictx->Instrux->Length = 0;
+    Ictx->Instrux->OpLength = 0;
 
     Ictx->Instrux->DefCode = (ND_UINT8)Ictx->Context->DefCode;
     Ictx->Instrux->DefData = (ND_UINT8)Ictx->Context->DefData;
@@ -2728,6 +2761,54 @@ NdDecodeInternal(
 }
 
 
+//
+// NdDecodeInternal
+//
+// Bounds the decode window to the architectural instruction length and makes sure a failed decode never
+// leaves a structure that looks like a valid instruction. On failure the output carries the reason in the
+// returned status and the boundary in Instrux->Length (how far decoding progressed), but the instruction
+// identity (class, definition, operand counts) is cleared, so callers can tell a failure apart from a
+// truncated-but-valid instruction even when they use ND_OPTION_SKIP_ZERO_INSTRUX.
+//
+static NDSTATUS
+NdDecodeInternal(
+    ND_INTERNAL_CONTEXT *Ictx,
+    const ND_UINT8 *Code,
+    ND_SIZET Size
+)
+{
+    NDSTATUS status;
+    ND_SIZET callerSize = Size;
+
+    // No instruction can consume more than 15 bytes. Clamping the window guarantees that no fetch helper
+    // can read past the architectural limit, even when the caller supplied a larger buffer or asked for
+    // ND_OPTION_SKIP_CACHE_IBYTES with a window that extends beyond one instruction.
+    if (Size > ND_MAX_INSTRUCTION_LENGTH)
+    {
+        Size = ND_MAX_INSTRUCTION_LENGTH;
+    }
+
+    status = NdDecodeInternalWorker(Ictx, Code, Size);
+
+    if (!ND_SUCCESS(status))
+    {
+        // A decode that ran out of bytes inside the clamped window means INSTRUCTION_TOO_LONG only when
+        // the caller did provide a 16th byte. If the caller's window was 15 bytes or shorter, the window
+        // itself was too small for whatever was being decoded.
+        if ((ND_STATUS_BUFFER_TOO_SMALL == status) && (callerSize > ND_MAX_INSTRUCTION_LENGTH))
+        {
+            status = ND_STATUS_INSTRUCTION_TOO_LONG;
+        }
+
+        // Remove the instruction identity, but keep Length: it is the boundary information the caller
+        // needs in order to find out where decoding stopped.
+        NdInvalidateInstruxMini(Ictx->Instrux);
+    }
+
+    return status;
+}
+
+
 NDSTATUS
 NdDecodeWithContext(
     INSTRUX *Instrux,
@@ -2799,6 +2880,14 @@ NdDecodeWithContext(
     status = NdDecodeInternal(&iCtx, Instrux->InstructionBytes, Size);
     if (!ND_SUCCESS(status))
     {
+        // NdDecodeInternal already cleared the instruction identity. Also drop the metadata and mnemonic
+        // that may still describe the previous instruction when zeroing was skipped.
+        Instrux->Attributes = 0;
+        Instrux->Category = (ND_INS_CATEGORY)ND_CAT_INVALID;
+        Instrux->IsaSet = (ND_INS_SET)ND_SET_INVALID;
+#ifndef BDDISASM_NO_MNEMONIC
+        Instrux->Mnemonic = ND_NULL;
+#endif // !BDDISASM_NO_MNEMONIC
         return status;
     }
 
@@ -2832,6 +2921,15 @@ NdDecodeWithContext(
                                 iCtx.Idbe->Operands[opIndex]);
         if (!ND_SUCCESS(status))
         {
+            // A partially decoded instruction must not look valid. Clear the identity (and, for the full
+            // structure, the metadata copied above), while leaving Length as the boundary marker.
+            Instrux->Attributes = 0;
+            Instrux->Category = (ND_INS_CATEGORY)ND_CAT_INVALID;
+            Instrux->IsaSet = (ND_INS_SET)ND_SET_INVALID;
+#ifndef BDDISASM_NO_MNEMONIC
+            Instrux->Mnemonic = ND_NULL;
+#endif // !BDDISASM_NO_MNEMONIC
+            NdInvalidateInstruxMini((INSTRUX_MINI *)Instrux);
             return status;
         }
     }
@@ -2850,7 +2948,6 @@ NdDecodeWithContextMini(
 )
 {
     ND_INTERNAL_CONTEXT iCtx;
-    ND_SIZET toFetch;
     ND_UINT8 iBytes[ND_MAX_INSTRUCTION_LENGTH];
     const ND_UINT8 *iCode = ND_NULL;
 
@@ -2898,7 +2995,7 @@ NdDecodeWithContextMini(
 
     if (0 == (Context->Options & ND_OPTION_SKIP_CACHE_IBYTES))
     {
-        toFetch = (Size < ND_MAX_INSTRUCTION_LENGTH) ? Size : ND_MAX_INSTRUCTION_LENGTH;
+        ND_SIZET toFetch = (Size < ND_MAX_INSTRUCTION_LENGTH) ? Size : ND_MAX_INSTRUCTION_LENGTH;
 
         // Fetch the instruction bytes. Note than in regular decode mode, ND_OPT_SKIP_CACHE_IBYTES is ignored.
         for (ND_SIZET i = 0; i < toFetch; i++)
@@ -2910,7 +3007,6 @@ NdDecodeWithContextMini(
     }
     else
     {
-        toFetch = Size;
         iCode = Code;
     }
 
@@ -2919,8 +3015,10 @@ NdDecodeWithContextMini(
     iCtx.Instrux = (INSTRUX_MINI*)Instrux;
     iCtx.Idbe = ND_NULL;
 
-    // Decode the instruction.
-    return NdDecodeInternal(&iCtx, iCode, toFetch);
+    // Decode the instruction. The original "Size" is passed on so that NdDecodeInternal can tell a window
+    // that is genuinely too short from an instruction that exceeds 15 bytes; it clamps the reads it performs
+    // to ND_MAX_INSTRUCTION_LENGTH, so "iBytes" (which holds at most 15 bytes) is never over-read.
+    return NdDecodeInternal(&iCtx, iCode, Size);
 }
 
 

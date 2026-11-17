@@ -5,6 +5,9 @@
 #include "include/bddisasm_crt.h"
 #include "../inc/bddisasm.h"
 
+// Internal headers. Needed to validate instruction definitions before emitting text.
+#include "bdx86_tabledefs.h"
+
 
 #if !defined(BDDISASM_NO_MNEMONIC) && !defined(BDDISASM_NO_FORMAT)
 
@@ -154,6 +157,13 @@ NdSprintf(
         return ND_STATUS_INVALID_PARAMETER;
     }
 
+    // A size of zero would underflow "DestinationSize - 1" and hand vsnprintf an unbounded count. The
+    // formatter never calls this with such a size, but the helper must not depend on that.
+    if (DestinationSize < 2)
+    {
+        return ND_STATUS_BUFFER_OVERFLOW;
+    }
+
     nd_memzero(Destination, DestinationSize);
 
     va_start(args, Formatstring);
@@ -167,6 +177,144 @@ NdSprintf(
     if ((res < 0) || ((ND_SIZET)res >= DestinationSize - 1))
     {
         return ND_STATUS_BUFFER_OVERFLOW;
+    }
+
+    return ND_STATUS_SUCCESS;
+}
+
+
+//
+// NdGetGprName
+//
+// Returns the textual name of a general purpose register, or NULL if the register index cannot be represented
+// for the requested size. The 8 bit legacy table only contains al..bh: with a legacy encoded instruction that
+// has no REX/REX2 prefix, indexes 4..7 name ah..bh, and no index above 7 names an 8 bit register at all. A
+// REX/REX2 (or a non-legacy encoding) selects the spl..r31b table, which contains ND_MAX_GPR_REGS entries.
+//
+static const char *
+NdGetGprName(
+    const INSTRUX_MINI *Instrux,
+    ND_UINT32 Reg,
+    ND_REG_SIZE Size
+)
+{
+    // Every GPR table is indexed by the 5 bit register number, so reject out of range indexes first.
+    if (Reg >= (ND_UINT32)ND_MAX_GPR_REGS)
+    {
+        return ND_NULL;
+    }
+
+    switch (Size)
+    {
+    case ND_SIZE_8BIT:
+        if ((Instrux->EncMode != ND_ENCM_LEGACY) || Instrux->HasRex || Instrux->HasRex2)
+        {
+            return gReg8Bit64[Reg];
+        }
+
+        // Legacy 8 bit registers without REX/REX2: only al..bh exist.
+        if (Reg >= 8)
+        {
+            return ND_NULL;
+        }
+
+        return gReg8Bit[Reg];
+
+    case ND_SIZE_16BIT:
+        return gReg16Bit[Reg];
+
+    case ND_SIZE_32BIT:
+        return gReg32Bit[Reg];
+
+    case ND_SIZE_64BIT:
+        return gReg64Bit[Reg];
+
+    default:
+        return ND_NULL;
+    }
+}
+
+
+//
+// NdValidateInstruxForText
+//
+// Structural validation performed before any text is emitted. It rejects instructions that cannot have come
+// out of a successful decode, so that a malformed or stale INSTRUX can never be rendered as a plausible
+// instruction. Every check is a pure read: the instruction is not modified.
+//
+static NDSTATUS
+NdValidateInstruxForText(
+    const INSTRUX_MINI *Instrux
+)
+{
+    const ND_IDBE *idbe;
+
+    // An invalid instruction class is what a zeroed or failed INSTRUX holds.
+    if (ND_INS_INVALID == Instrux->Instruction)
+    {
+        return ND_STATUS_INVALID_INSTRUX;
+    }
+
+    // The instruction must occupy between 1 and 15 bytes.
+    if ((Instrux->Length < 1) || (Instrux->Length > ND_MAX_INSTRUCTION_LENGTH))
+    {
+        return ND_STATUS_INVALID_INSTRUX;
+    }
+
+    // Operand counts must be consistent and within the array that backs them.
+    if ((Instrux->ExpOperandsCount > ND_MAX_OPERAND) ||
+        (Instrux->OperandsCount > ND_MAX_OPERAND) ||
+        (Instrux->OperandsCount < Instrux->ExpOperandsCount))
+    {
+        return ND_STATUS_INVALID_INSTRUX;
+    }
+
+    // Decode modes, all of which are used to derive sizes.
+    if ((Instrux->DefCode > ND_CODE_64) ||
+        (Instrux->DefData > ND_DATA_64) ||
+        (Instrux->DefStack > ND_STACK_64) ||
+        (Instrux->AddrMode > ND_ADDR_64) ||
+        (Instrux->OpMode > ND_OPSZ_64) ||
+        (Instrux->EfOpMode > ND_OPSZ_64) ||
+        (Instrux->VecMode > ND_VECM_512) ||
+        (Instrux->EfVecMode > ND_VECM_512))
+    {
+        return ND_STATUS_INVALID_INSTRUX;
+    }
+
+    // WordLength is used for relative offset truncation.
+    if ((2 != Instrux->WordLength) && (4 != Instrux->WordLength) && (8 != Instrux->WordLength))
+    {
+        return ND_STATUS_INVALID_INSTRUX;
+    }
+
+    // The instruction field layout must fit inside Length. OpLength is a 2 bit field, so its upper
+    // bound is already enforced by the structure, but a zero is still possible.
+    if ((Instrux->PrefLength > Instrux->Length) ||
+        (Instrux->OpLength < 1) ||
+        ((ND_UINT32)Instrux->OpOffset + Instrux->OpLength > Instrux->Length) ||
+        (Instrux->MainOpOffset >= Instrux->Length) ||
+        (Instrux->HasModRm && (Instrux->ModRmOffset >= Instrux->Length)))
+    {
+        return ND_STATUS_INVALID_INSTRUX;
+    }
+
+    // The instruction definition must exist and must be the one the instruction class claims.
+    idbe = NdIdbeGetEntry(Instrux->Idbe);
+    if (ND_NULL == idbe)
+    {
+        return ND_STATUS_INVALID_INSTRUX;
+    }
+
+    if (idbe->Instruction != (ND_UINT16)Instrux->Instruction)
+    {
+        return ND_STATUS_INVALID_INSTRUX;
+    }
+
+    // A decoded instruction always has a mnemonic.
+    if (ND_NULL == NdGetMnemonicMini(Instrux))
+    {
+        return ND_STATUS_INVALID_INSTRUX;
     }
 
     return ND_STATUS_SUCCESS;
@@ -192,10 +340,21 @@ NdToTextInternal(
     const ND_OPERAND *pOp;
     ND_BOOL alignmentStored;
 
+// Any formatting failure must leave the output empty, so that truncated text is never mistaken for a
+// complete instruction. The status code is the machine readable reason.
+#define NDTOTEXT_FAIL(st)                            \
+{                                                    \
+    nd_memzero(Buffer, BufferSize);                  \
+    return (st);                                     \
+}
+
 #define NDTOTEXT_APPEND(str)                         \
 {                                                    \
     res = nd_strcat_s(Buffer, BufferSize, (str));    \
-    RET_EQ(res, ND_NULL, ND_STATUS_BUFFER_OVERFLOW); \
+    if (ND_NULL == res)                              \
+    {                                                \
+        NDTOTEXT_FAIL(ND_STATUS_BUFFER_OVERFLOW);    \
+    }                                                \
 }
 
     // pre-init
@@ -205,18 +364,14 @@ NdToTextInternal(
     pOp = (const ND_OPERAND *)ND_NULL;
     alignmentStored = ND_FALSE;
 
-    // Validate args.
-    if (ND_NULL == Instrux)
-    {
-        return ND_STATUS_INVALID_PARAMETER;
-    }
-
     if (ND_NULL == Buffer)
     {
         return ND_STATUS_INVALID_PARAMETER;
     }
 
-    if (BufferSize < ND_MIN_BUF_SIZE)
+    // Any positive size works. A buffer that is too small to hold the text is reported as a truncation
+    // (ND_STATUS_BUFFER_OVERFLOW) with an empty buffer, not as an invalid argument.
+    if (0 == BufferSize)
     {
         return ND_STATUS_INVALID_PARAMETER;
     }
@@ -224,6 +379,20 @@ NdToTextInternal(
     // init the text.
     nd_memzero(Buffer, BufferSize);
     nd_memzero(temp, sizeof(temp));
+
+    // A NULL instruction has nothing to render. Leave the output empty, so the caller never reads stale
+    // text from a previous call.
+    if (ND_NULL == Instrux)
+    {
+        return ND_STATUS_INVALID_PARAMETER;
+    }
+
+    // Refuse to format anything that a successful decode cannot produce.
+    status = NdValidateInstruxForText(Instrux);
+    if (!ND_SUCCESS(status))
+    {
+        NDTOTEXT_FAIL(status);
+    }
 
     // First, store the prefixes.
 
@@ -354,15 +523,17 @@ NdToTextInternal(
             status = NdGetOperandMini(Instrux, opIndex, &localOp);
             if (!ND_SUCCESS(status))
             {
-                return status;
+                NDTOTEXT_FAIL(status);
             }
 
             pOp = &localOp;
         }
 
+        // An explicit operand is never "not present": that type only marks unused trailing slots. Stopping
+        // here would silently drop every operand after it from the text.
         if (pOp->Type == ND_OP_NOT_PRESENT)
         {
-            break;
+            NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
         }
 
         if (pOp->Flags.IsDefault)
@@ -424,44 +595,13 @@ NdToTextInternal(
             {
             case ND_REG_GPR:
             {
-                if (pOp->Info.Register.Reg >= ND_MAX_GPR_REGS)
+                const char *regName = NdGetGprName(Instrux, pOp->Info.Register.Reg, pOp->Info.Register.Size);
+                if (ND_NULL == regName)
                 {
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
 
-                // General purpose register.
-                switch (pOp->Info.Register.Size)
-                {
-                case ND_SIZE_8BIT:
-                    // 8 bit register.
-                    if ((Instrux->EncMode != ND_ENCM_LEGACY) || Instrux->HasRex || Instrux->HasRex2)
-                    {
-                        NDTOTEXT_APPEND(gReg8Bit64[pOp->Info.Register.Reg]);
-                    }
-                    else
-                    {
-                        NDTOTEXT_APPEND(gReg8Bit[pOp->Info.Register.Reg]);
-                    }
-                    break;
-
-                case ND_SIZE_16BIT:
-                    // 16 bit register.
-                    NDTOTEXT_APPEND(gReg16Bit[pOp->Info.Register.Reg]);
-                    break;
-
-                case ND_SIZE_32BIT:
-                    // 32 bit register.
-                    NDTOTEXT_APPEND(gReg32Bit[pOp->Info.Register.Reg]);
-                    break;
-
-                case ND_SIZE_64BIT:
-                    // 64 bit register.
-                    NDTOTEXT_APPEND(gReg64Bit[pOp->Info.Register.Reg]);
-                    break;
-
-                default:
-                    return ND_STATUS_INVALID_INSTRUX;
-                }
+                NDTOTEXT_APPEND(regName);
             }
             break;
 
@@ -469,7 +609,7 @@ NdToTextInternal(
             {
                 if (pOp->Info.Register.Reg >= ND_MAX_SEG_REGS)
                 {
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
 
                 NDTOTEXT_APPEND(gRegSeg[pOp->Info.Register.Reg]);
@@ -480,7 +620,7 @@ NdToTextInternal(
             {
                 if (pOp->Info.Register.Reg >= ND_MAX_FPU_REGS)
                 {
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
 
                 NDTOTEXT_APPEND(gRegFpu[pOp->Info.Register.Reg]);
@@ -491,7 +631,7 @@ NdToTextInternal(
             {
                 if (pOp->Info.Register.Reg >= ND_MAX_MMX_REGS)
                 {
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
 
                 NDTOTEXT_APPEND(gRegMmx[pOp->Info.Register.Reg]);
@@ -502,7 +642,7 @@ NdToTextInternal(
             {
                 if (pOp->Info.Register.Reg >= ND_MAX_SSE_REGS)
                 {
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
 
                 switch (pOp->Info.Register.Size)
@@ -517,7 +657,7 @@ NdToTextInternal(
                     NDTOTEXT_APPEND(gRegZmm[pOp->Info.Register.Reg]);
                     break;
                 default:
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
             }
             break;
@@ -526,7 +666,7 @@ NdToTextInternal(
             {
                 if (pOp->Info.Register.Reg >= ND_MAX_CR_REGS)
                 {
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
 
                 NDTOTEXT_APPEND(gRegControl[pOp->Info.Register.Reg]);
@@ -537,7 +677,7 @@ NdToTextInternal(
             {
                 if (pOp->Info.Register.Reg >= ND_MAX_DR_REGS)
                 {
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
 
                 NDTOTEXT_APPEND(gRegDebug[pOp->Info.Register.Reg]);
@@ -548,7 +688,7 @@ NdToTextInternal(
             {
                 if (pOp->Info.Register.Reg >= ND_MAX_TR_REGS)
                 {
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
 
                 NDTOTEXT_APPEND(gRegTest[pOp->Info.Register.Reg]);
@@ -560,7 +700,7 @@ NdToTextInternal(
                 // Sanity check.
                 if (pOp->Info.Register.Reg >= ND_MAX_BND_REGS)
                 {
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
 
                 NDTOTEXT_APPEND(gRegBound[pOp->Info.Register.Reg]);
@@ -572,7 +712,7 @@ NdToTextInternal(
                 // Sanity check.
                 if (pOp->Info.Register.Reg >= ND_MAX_MSK_REGS)
                 {
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
 
                 NDTOTEXT_APPEND(gRegMask[pOp->Info.Register.Reg]);
@@ -584,7 +724,7 @@ NdToTextInternal(
                 // Sanity check.
                 if (pOp->Info.Register.Reg >= ND_MAX_TILE_REGS)
                 {
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
 
                 NDTOTEXT_APPEND(gRegTile[pOp->Info.Register.Reg]);
@@ -592,7 +732,20 @@ NdToTextInternal(
             break;
 
             default:
+                // The flags register is the only register class that is exposed as an explicit operand but
+                // has no textual form (PUSHF/POPF and friends). Any other class in this position means the
+                // structure was not produced by the decoder; rendering the remaining operands would hide it.
+                if (ND_REG_FLG != pOp->Info.Register.Type)
+                {
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
+                }
                 break;
+            }
+
+            // A zero register count means the operand accesses no register, which a decode never produces.
+            if (0 == pOp->Info.Register.Count)
+            {
+                NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
             }
 
             if (pOp->Info.Register.Count > 1)
@@ -600,7 +753,7 @@ NdToTextInternal(
                 status = NdSprintf(temp, sizeof(temp), "+%d", pOp->Info.Register.Count - 1);
                 if (!ND_SUCCESS(status))
                 {
-                    return status;
+                    NDTOTEXT_FAIL(status);
                 }
 
                 NDTOTEXT_APPEND(temp);
@@ -614,11 +767,17 @@ NdToTextInternal(
 
         case ND_OP_CONST:
         {
-            // Implicit constant
+            // Implicit constant. The decoder only ever produces the small architectural constants (1, 3, 8,
+            // 0x0F &c.), so anything that does not fit in 32 bits did not come from a decode.
+            if (pOp->Info.Constant.Const > 0xFFFFFFFFULL)
+            {
+                NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
+            }
+
             status = NdSprintf(temp, sizeof(temp), "%d", pOp->Info.Constant.Const);
             if (!ND_SUCCESS(status))
             {
-                return status;
+                NDTOTEXT_FAIL(status);
             }
 
             NDTOTEXT_APPEND(temp);
@@ -641,10 +800,14 @@ NdToTextInternal(
             case 8:
                 status = NdSprintf(temp, sizeof(temp), "0x%016llx", (ND_UINT64)pOp->Info.Immediate.Imm);
                 break;
+            default:
+                // Without this, an unsupported width would fall through with "status" still SUCCESS and
+                // append whatever the previous operand left behind in "temp".
+                NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
             }
             if (!ND_SUCCESS(status))
             {
-                return status;
+                NDTOTEXT_FAIL(status);
             }
 
             NDTOTEXT_APPEND(temp);
@@ -671,7 +834,7 @@ NdToTextInternal(
             status = NdSprintf(temp, sizeof(temp), "0x%llx", dest);
             if (!ND_SUCCESS(status))
             {
-                return status;
+                NDTOTEXT_FAIL(status);
             }
 
             NDTOTEXT_APPEND(temp);
@@ -695,12 +858,12 @@ NdToTextInternal(
                     pOp->Info.Address.BaseSeg, (ND_UINT64)pOp->Info.Address.Offset);
                 break;
             default:
-                return ND_STATUS_INVALID_INSTRUX;
+                NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
             }
 
             if (!ND_SUCCESS(status))
             {
-                return status;
+                NDTOTEXT_FAIL(status);
             }
 
             NDTOTEXT_APPEND(temp);
@@ -712,7 +875,7 @@ NdToTextInternal(
             status = NdSprintf(temp, sizeof(temp), "0x%016llx", pOp->Info.AddressNear.Target);
             if (!ND_SUCCESS(status))
             {
-                return status;
+                NDTOTEXT_FAIL(status);
             }
 
             NDTOTEXT_APPEND(temp);
@@ -721,6 +884,18 @@ NdToTextInternal(
 
         case ND_OP_MEM:
         {
+            // A broadcast always replicates at least two elements; "{1to0}" would name no real access.
+            if (pOp->Info.Memory.HasBroadcast && (pOp->Info.Memory.Broadcast.Count < 2))
+            {
+                NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
+            }
+
+            // RIP-relative addressing only exists in 64 bit mode.
+            if (pOp->Info.Memory.IsRipRel && (ND_CODE_64 != Instrux->DefCode))
+            {
+                NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
+            }
+
             // Prepend the size. For VSIB addressing, store the VSIB element size, not the total accessed size.
             ND_OPERAND_SIZE size = pOp->Info.Memory.IsVsib ? pOp->Info.Memory.Vsib.ElemSize : pOp->Size;
 
@@ -784,22 +959,20 @@ NdToTextInternal(
             // Base, if any.
             if (pOp->Info.Memory.HasBase)
             {
-                // No need for Base range checks, as it is limited by the data type representation - 5 bits.
-                //if (pOp->Info.Memory.Base >= ND_MAX_GPR_REGS)
-                //{
-                //    return ND_STATUS_INVALID_INSTRUX;
-                //}
-
+                // The base is limited to 5 bits by the structure, which is exactly the size of the GPR name
+                // tables. The 8 bit form still needs NdGetGprName, because the legacy table only carries
+                // al..bh when REX/REX2 is absent.
                 switch (pOp->Info.Memory.BaseSize)
                 {
                 case ND_SIZE_8BIT:
-                    if ((Instrux->EncMode != ND_ENCM_LEGACY) || Instrux->HasRex || Instrux->HasRex2)
                     {
-                        NDTOTEXT_APPEND(gReg8Bit64[pOp->Info.Memory.Base]);
-                    }
-                    else
-                    {
-                        NDTOTEXT_APPEND(gReg8Bit[pOp->Info.Memory.Base]);
+                        const char *baseName = NdGetGprName(Instrux, pOp->Info.Memory.Base, ND_SIZE_8BIT);
+                        if (ND_NULL == baseName)
+                        {
+                            NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
+                        }
+
+                        NDTOTEXT_APPEND(baseName);
                     }
                     break;
                 case ND_SIZE_16BIT:
@@ -812,7 +985,7 @@ NdToTextInternal(
                     NDTOTEXT_APPEND(gReg64Bit[pOp->Info.Memory.Base]);
                     break;
                 default:
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
             }
 
@@ -821,7 +994,7 @@ NdToTextInternal(
             {
                 if (pOp->Info.Memory.Index >= (pOp->Info.Memory.IsVsib ? ND_MAX_SSE_REGS : ND_MAX_GPR_REGS))
                 {
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
 
                 if (pOp->Info.Memory.HasBase)
@@ -832,13 +1005,14 @@ NdToTextInternal(
                 switch (pOp->Info.Memory.IndexSize)
                 {
                 case ND_SIZE_8BIT:
-                    if ((Instrux->EncMode != ND_ENCM_LEGACY) || Instrux->HasRex || Instrux->HasRex2)
                     {
-                        NDTOTEXT_APPEND(gReg8Bit64[pOp->Info.Memory.Index]);
-                    }
-                    else
-                    {
-                        NDTOTEXT_APPEND(gReg8Bit[pOp->Info.Memory.Index]);
+                        const char *indexName = NdGetGprName(Instrux, pOp->Info.Memory.Index, ND_SIZE_8BIT);
+                        if (ND_NULL == indexName)
+                        {
+                            NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
+                        }
+
+                        NDTOTEXT_APPEND(indexName);
                     }
                     break;
                 case ND_SIZE_16BIT:
@@ -860,16 +1034,23 @@ NdToTextInternal(
                     NDTOTEXT_APPEND(gRegZmm[pOp->Info.Memory.Index]);
                     break;
                 default:
-                    return ND_STATUS_INVALID_INSTRUX;
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
                 }
 
-                // If index is present, scale is also present.
+                // If index is present, scale is also present. It can only be 1, 2, 4 or 8.
+                if ((pOp->Info.Memory.Scale != 1) && (pOp->Info.Memory.Scale != 2) &&
+                    (pOp->Info.Memory.Scale != 4) && (pOp->Info.Memory.Scale != 8) &&
+                    !pOp->Info.Memory.IsMib)
+                {
+                    NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
+                }
+
                 if (pOp->Info.Memory.Scale != 1 && !pOp->Info.Memory.IsMib)
                 {
                     status = NdSprintf(temp, sizeof(temp), "*%d", pOp->Info.Memory.Scale);
                     if (!ND_SUCCESS(status))
                     {
-                        return status;
+                        NDTOTEXT_FAIL(status);
                     }
 
                     NDTOTEXT_APPEND(temp);
@@ -959,7 +1140,7 @@ NdToTextInternal(
                 }
                 if (!ND_SUCCESS(status))
                 {
-                    return status;
+                    NDTOTEXT_FAIL(status);
                 }
 
                 NDTOTEXT_APPEND(temp);
@@ -974,7 +1155,7 @@ NdToTextInternal(
                 status = NdSprintf(temp, sizeof(temp), "{1to%d}", pOp->Info.Memory.Broadcast.Count);
                 if (!ND_SUCCESS(status))
                 {
-                    return status;
+                    NDTOTEXT_FAIL(status);
                 }
 
                 NDTOTEXT_APPEND(temp);
@@ -983,7 +1164,7 @@ NdToTextInternal(
         break;
 
         default:
-            return ND_STATUS_INVALID_INSTRUX;
+            NDTOTEXT_FAIL(ND_STATUS_INVALID_INSTRUX);
         }
 
         // Handle masking.
@@ -998,7 +1179,7 @@ NdToTextInternal(
             status = NdSprintf(temp, sizeof(temp), "{%s}", gRegMask[pOp->Decorator.Msk]);
             if (!ND_SUCCESS(status))
             {
-                return status;
+                NDTOTEXT_FAIL(status);
             }
 
             NDTOTEXT_APPEND(temp);
@@ -1027,7 +1208,7 @@ NdToTextInternal(
                 status = NdSprintf(temp, sizeof(temp), "{%s-sae}", gEmbeddedRounding[Instrux->RoundingMode]);
                 if (!ND_SUCCESS(status))
                 {
-                    return status;
+                    NDTOTEXT_FAIL(status);
                 }
 
                 NDTOTEXT_APPEND(temp);
@@ -1048,7 +1229,11 @@ NdToText(
     char *Buffer
 )
 {
-    return NdToTextInternal((INSTRUX_MINI *)Instrux, Instrux->Operands, Rip, BufferSize, Buffer);
+    // Do not touch "Instrux" here: NdToTextInternal validates the pointer, and dereferencing it before that
+    // check would fault on a NULL instruction.
+    return NdToTextInternal((INSTRUX_MINI *)Instrux,
+                            (ND_NULL == Instrux) ? ND_NULL : Instrux->Operands,
+                            Rip, BufferSize, Buffer);
 }
 
 
