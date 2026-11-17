@@ -1,0 +1,2 @@
+# Integration test build artifact (built by `make` / `make test`).
+/bdshemu_selfmodifying_test
