@@ -1442,6 +1442,15 @@ ShemuX86SetOperandValue(
         // Compute the GLA.
         ND_UINT64 gla = ShemuX86ComputeLinearAddress(Context, op);
 
+        // Set the value. Note that the state bitmaps are updated only AFTER the store succeeds,
+        // so that a rejected store (for example, one that crosses a region boundary) does not
+        // leave behind false self-write or saved-RIP indications; this keeps the state auditable.
+        status = ShemuMemStore(Context, gla, MIN(op->Size, Value->Size), Value->Value.Bytes);
+        if (SHEMU_SUCCESS != status)
+        {
+            return status;
+        }
+
         // Handle self-write. We store a 1 for each written byte inside the shellcode space. Once the modified bytes
         // are executed, we can trigger the self-write detection.
         if (ShemuIsShellcodePtr(Context, gla, op->Size))
@@ -1456,21 +1465,21 @@ ShemuX86SetOperandValue(
             if (Context->Arch.X86.Instruction.Instruction == ND_INS_CALLNR ||
                 Context->Arch.X86.Instruction.Instruction == ND_INS_CALLNI)
             {
-                ShemuStackBmpStateSet(Context, gla - Context->StackBase, 
+                ShemuStackBmpStateSet(Context, gla - Context->StackBase,
                                       Context->Arch.X86.Instruction.WordLength, STACK_BYTE_RIP);
             }
             else if (Context->Arch.X86.Instruction.Instruction == ND_INS_FNSTENV)
             {
-                // OK: op->Size will be the FPU state size (28 bytes); we only emulate 32 & 64 bit forms, the RIP is 
+                // OK: op->Size will be the FPU state size (28 bytes); we only emulate 32 & 64 bit forms, the RIP is
                 // always 4 bytes.
-                ShemuStackBmpStateSet(Context, (gla + 0xC) - Context->StackBase, 
+                ShemuStackBmpStateSet(Context, (gla + 0xC) - Context->StackBase,
                                       MIN(Context->Arch.X86.Instruction.WordLength, 4), STACK_BYTE_RIP);
             }
-            else if (Context->Arch.X86.Instruction.Instruction == ND_INS_FXSAVE || 
+            else if (Context->Arch.X86.Instruction.Instruction == ND_INS_FXSAVE ||
                 Context->Arch.X86.Instruction.Instruction == ND_INS_FXSAVE64)
             {
                 // OK: op->Size will be the FXSAVE size (512 bytes).
-                ShemuStackBmpStateSet(Context, (gla + 0x8) - Context->StackBase, 
+                ShemuStackBmpStateSet(Context, (gla + 0x8) - Context->StackBase,
                                       Context->Arch.X86.Instruction.WordLength, STACK_BYTE_RIP);
             }
             else
@@ -1478,13 +1487,6 @@ ShemuX86SetOperandValue(
                 // Something is written on a previously saved RIP; reset it.
                 ShemuStackBmpStateClear(Context, gla - Context->StackBase, op->Size, STACK_BYTE_RIP);
             }
-        }
-
-        // Set the value.
-        status = ShemuMemStore(Context, gla, MIN(op->Size, Value->Size), Value->Value.Bytes);
-        if (SHEMU_SUCCESS != status)
-        {
-            return status;
         }
 
         if (Context->Options & SHEMU_OPT_TRACE_MEMORY)
@@ -2825,6 +2827,18 @@ check_far_branch:
             // so iteration #1 must run even at MaxInstructionsCount == 1.
             do
             {
+                ND_UINT64 savRcx, savRsi, savRdi;
+
+                // Snapshot the string registers before each iteration. If the iteration faults
+                // (for example, the source or the destination crosses a memory region boundary),
+                // they are rolled back, so the architectural state reflects only the completed
+                // iterations, and the abort can be audited by the caller. Note that the raw
+                // registers are saved directly, without going through the tracking accessors,
+                // as a rolled back iteration must not leave tracking marks either.
+                savRcx = Context->Arch.X86.Registers.RegRcx;
+                savRsi = Context->Arch.X86.Registers.RegRsi;
+                savRdi = Context->Arch.X86.Registers.RegRdi;
+
                 // Get the RCX value.
                 GET_OP(Context, 2, &dst);
 
@@ -2833,9 +2847,21 @@ check_far_branch:
                     break;
                 }
 
-                // Load the source into the destination.
+                // Load the source into the destination. If the load fails, no register has been
+                // modified yet (the string registers are updated only after a successful access),
+                // so the state is already consistent.
                 GET_OP(Context, 1, &src);
-                SET_OP(Context, 0, &src);
+
+                shstatus = ShemuX86SetOperandValue(Context, 0, &src);
+                if (SHEMU_SUCCESS != shstatus)
+                {
+                    // The store failed after the source load already advanced its string register.
+                    // Roll back to the pre-iteration state, so RCX/RSI/RDI stay in sync.
+                    Context->Arch.X86.Registers.RegRcx = savRcx;
+                    Context->Arch.X86.Registers.RegRsi = savRsi;
+                    Context->Arch.X86.Registers.RegRdi = savRdi;
+                    return shstatus;
+                }
 
                 if (Context->Arch.X86.Instruction.IsRepeated)
                 {
@@ -2857,6 +2883,14 @@ check_far_branch:
             // Same budget contract as MOVS above.
             do
             {
+                ND_UINT64 savRcx, savRsi, savRdi;
+
+                // Snapshot the string registers, so a faulting iteration can be rolled back
+                // (see the MOVS case above).
+                savRcx = Context->Arch.X86.Registers.RegRcx;
+                savRsi = Context->Arch.X86.Registers.RegRsi;
+                savRdi = Context->Arch.X86.Registers.RegRdi;
+
                 // Get the RCX value.
                 GET_OP(Context, 2, &dst);
 
@@ -2869,7 +2903,17 @@ check_far_branch:
                 nd_memzero(&dst, sizeof(dst));
 
                 GET_OP(Context, 0, &dst);
-                GET_OP(Context, 1, &src);
+
+                shstatus = ShemuX86GetOperandValue(Context, 1, &src);
+                if (SHEMU_SUCCESS != shstatus)
+                {
+                    // The second load failed after the first one already advanced its string
+                    // register. Roll back to the pre-iteration state.
+                    Context->Arch.X86.Registers.RegRcx = savRcx;
+                    Context->Arch.X86.Registers.RegRsi = savRsi;
+                    Context->Arch.X86.Registers.RegRdi = savRdi;
+                    return shstatus;
+                }
 
                 res.Size = dst.Size;
                 res.Value.Qwords[0] = dst.Value.Qwords[0] - src.Value.Qwords[0];

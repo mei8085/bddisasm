@@ -301,6 +301,48 @@
         "command": "shemu"
     },
     {
+        "f_source": "x86/basic/test_64_bound01.asm",
+        "f_result": "x86/basic/test_64_bound01.result",
+        "f_test": "x86/basic/test_64_bound01.test",
+        "options": "-b64 -skipdecoded",
+        "command": "shemu"
+    },
+    {
+        "f_source": "x86/basic/test_64_bound02.asm",
+        "f_result": "x86/basic/test_64_bound02.result",
+        "f_test": "x86/basic/test_64_bound02.test",
+        "options": "-b64 -skipdecoded",
+        "command": "shemu"
+    },
+    {
+        "f_source": "x86/basic/test_64_bound03.asm",
+        "f_result": "x86/basic/test_64_bound03.result",
+        "f_test": "x86/basic/test_64_bound03.test",
+        "options": "-b64 -skipdecoded",
+        "command": "shemu"
+    },
+    {
+        "f_source": "x86/basic/test_64_bound04.asm",
+        "f_result": "x86/basic/test_64_bound04.result",
+        "f_test": "x86/basic/test_64_bound04.test",
+        "options": "-b64 -skipdecoded",
+        "command": "shemu"
+    },
+    {
+        "f_source": "x86/basic/test_64_bound05.asm",
+        "f_result": "x86/basic/test_64_bound05.result",
+        "f_test": "x86/basic/test_64_bound05.test",
+        "options": "-b64 -skipdecoded",
+        "command": "shemu"
+    },
+    {
+        "f_source": "x86/basic/test_64_bound06.asm",
+        "f_result": "x86/basic/test_64_bound06.result",
+        "f_test": "x86/basic/test_64_bound06.test",
+        "options": "-b64 -skipdecoded",
+        "command": "shemu"
+    },
+    {
         "f_source": "x86/basic/test_64_bswap01.asm",
         "f_result": "x86/basic/test_64_bswap01.result",
         "f_test": "x86/basic/test_64_bswap01.test",

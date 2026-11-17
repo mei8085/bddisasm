@@ -23,12 +23,16 @@ typedef void
 //
 // Access memory function. Simply return true if the access was handled, or false if it wasn't.
 // If the function is not provided in SHEMU_CONTEXT, or if it returns false, the emulation will be terminated.
-// Note that the integrator is free to handle external memory access as it pleases. 
+// Note that the integrator is free to handle external memory access as it pleases.
 // Loads could always yield the same value (0), a random value or they could return actual memory values.
 // Stores could be discarded, or they could be buffered in a store-buffer like structure.
 // Note that by using the ShemuContext, the integrator knows whether the access is user or supervisor (the Ring field
 // inside ShemuContext), and he knows whether it is 16/32/64 bit mode (Mode field inside ShemuContext).
-// 
+// Note that accesses are isolated per memory region: this callback is invoked only for accesses that lie
+// entirely outside both the shellcode and the stack regions. An access that straddles a region boundary
+// (partially inside the shellcode or the stack, partially outside) is never delegated to this callback;
+// instead, the emulation is terminated with SHEMU_ABORT_GLA_OUTSIDE.
+//
 typedef ND_BOOL
 (*ShemuMemAccess)(
     void *ShemuContext, // Shemu emulation context.
@@ -261,7 +265,10 @@ typedef unsigned int SHEMU_STATUS;
 // Emulation abort reasons.
 //
 #define SHEMU_SUCCESS                           0           // Successfully emulated up to MaxInstructions.
-#define SHEMU_ABORT_GLA_OUTSIDE                 1           // A load or store outside the shellcode or the stack.
+#define SHEMU_ABORT_GLA_OUTSIDE                 1           // A load or store outside the shellcode or the stack,
+                                                            // or one that crosses a region boundary (the access is
+                                                            // rejected before any byte is read or written, and the
+                                                            // context is left in an auditable state).
 #define SHEMU_ABORT_RIP_OUTSIDE                 2           // A part of the instruction lies outside the shellcode.
 #define SHEMU_ABORT_INSTRUX_NOT_SUPPORTED       3           // An unsupported instruction was encountered.
 #define SHEMU_ABORT_OPERAND_NOT_SUPPORTED       4           // An unsupported operand was encountered.

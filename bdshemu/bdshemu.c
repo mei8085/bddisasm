@@ -191,6 +191,88 @@ ShemuBmpStateCheck(
 
 
 //
+// ShemuIsInsideWindow
+//
+static ND_BOOL
+ShemuIsInsideWindow(
+    ND_UINT64 Gla,
+    ND_UINT64 Size,
+    ND_UINT64 Base,
+    ND_UINT64 WindowSize
+    )
+//
+// Checks if the entire range [Gla, Gla + Size) is contained inside the window [Base, Base + WindowSize).
+// The check is done using subtractions only, so it is immune to address wrap-around: neither
+// Base + WindowSize nor Gla + Size are ever computed, therefore a window placed at the very top of the
+// address space, or an access whose end would wrap around 2^64, cannot bypass (or break) the check.
+//
+{
+    ND_UINT64 offset;
+
+    // The accessed size must fit inside the window. This also rejects huge, wrap-around-prone sizes.
+    if (Size > WindowSize)
+    {
+        return ND_FALSE;
+    }
+
+    // The access must start at or after the window base.
+    if (Gla < Base)
+    {
+        return ND_FALSE;
+    }
+
+    // Cannot underflow, as Gla >= Base.
+    offset = Gla - Base;
+
+    // The access must start inside the window.
+    if (offset >= WindowSize)
+    {
+        return ND_FALSE;
+    }
+
+    // The entire access must fit inside the window. Since offset < WindowSize, WindowSize - offset
+    // cannot underflow, and since Size <= WindowSize, offset + Size cannot overflow either.
+    return Size <= WindowSize - offset;
+}
+
+
+//
+// ShemuOverlapsWindow
+//
+static ND_BOOL
+ShemuOverlapsWindow(
+    ND_UINT64 Gla,
+    ND_UINT64 Size,
+    ND_UINT64 Base,
+    ND_UINT64 WindowSize
+    )
+//
+// Checks if the range [Gla, Gla + Size) overlaps the window [Base, Base + WindowSize) in any way.
+// Used to detect accesses that straddle a region boundary. Wrap-around safe, just like
+// ShemuIsInsideWindow.
+//
+{
+    if ((0 == Size) || (0 == WindowSize))
+    {
+        return ND_FALSE;
+    }
+
+    // The ranges overlap iff Gla starts before the window ends AND the window starts before Gla ends.
+    // Each comparison is done with a subtraction on the side that cannot underflow.
+    if (Gla >= Base)
+    {
+        // Gla starts inside, or after, the window: overlap iff Gla - Base < WindowSize.
+        return (Gla - Base) < WindowSize;
+    }
+    else
+    {
+        // Gla starts before the window: overlap iff Base - Gla < Size.
+        return (Base - Gla) < Size;
+    }
+}
+
+
+//
 // ShemuIsShellcodePtr
 //
 ND_BOOL
@@ -200,9 +282,7 @@ ShemuIsShellcodePtr(
     ND_UINT64 Size
     )
 {
-    return (Gla >= Context->ShellcodeBase && Gla < Context->ShellcodeBase + Context->ShellcodeSize &&
-            Gla + Size > Context->ShellcodeBase && Gla + Size <= Context->ShellcodeBase + Context->ShellcodeSize &&
-            Size <= Context->ShellcodeSize);
+    return ShemuIsInsideWindow(Gla, Size, Context->ShellcodeBase, Context->ShellcodeSize);
 }
 
 
@@ -216,9 +296,7 @@ ShemuIsStackPtr(
     ND_UINT64 Size
     )
 {
-    return (Gla >= Context->StackBase && Gla < Context->StackBase + Context->StackSize &&
-            Gla + Size > Context->StackBase && Gla + Size <= Context->StackBase + Context->StackSize &&
-            Size <= Context->StackSize);
+    return ShemuIsInsideWindow(Gla, Size, Context->StackBase, Context->StackSize);
 }
 
 
@@ -232,9 +310,7 @@ ShemuIsIcachePtr(
     ND_UINT64 Size
     )
 {
-    return (Gla >= Context->Icache.Address && Gla < Context->Icache.Address + Context->Icache.Size &&
-            Gla + Size > Context->Icache.Address && Gla + Size <= Context->Icache.Address + Context->Icache.Size &&
-            Size <= Context->Icache.Size);
+    return ShemuIsInsideWindow(Gla, Size, Context->Icache.Address, Context->Icache.Size);
 }
 
 
@@ -290,21 +366,30 @@ ShemuMemLoad(
         ND_UINT32 selfOffset = 0;
         ND_BOOL res = ND_FALSE;
 
+        // Access isolation: an access that partially overlaps the shellcode or the stack region
+        // (that is, it straddles a region boundary) is not fully inside any emulated region, and
+        // must NOT be delegated to the caller-mapped memory. Servicing it via AccessMemory would
+        // mix emulated bytes with external bytes, and would make the outcome depend on the
+        // integrator. Reject it with a locatable abort status instead, before any side effect
+        // (no bytes are copied, and the external access counter is not incremented).
+        if (ShemuOverlapsWindow(Gla, Size, Context->ShellcodeBase, Context->ShellcodeSize) ||
+            ShemuOverlapsWindow(Gla, Size, Context->StackBase, Context->StackSize))
+        {
+            return SHEMU_ABORT_GLA_OUTSIDE;
+        }
+
         // We allow a maximum number of external memory accesses, due to performance reasons.
         if (++Context->ExtMemAccess > Context->MemThreshold)
         {
             goto _check_special_access;
         }
 
-        // NOTE: The accessed GLA may partially access an internal address (shellcode or stack) and an external address.
-        // Since the AccessMemory callback can be provided with the full SHEMU_CONTEXT, the integrator can choose how
-        // to handle those accesses; some options are:
+        // NOTE: The accessed GLA is now guaranteed to be fully outside both the shellcode and the
+        // stack region, so it belongs entirely to the caller-mapped memory.
+        // The AccessMemory callback is provided with the full SHEMU_CONTEXT, and the integrator can
+        // choose how to handle those accesses; some options are:
         // - Don't handle them at all, and return error (ND_FALSE);
-        // - Handle them by reading the actual memory value; this has the disadvantage that if the shellcode/stack 
-        //   portion has been modified due to emulation, the AccessMemory function would return the original memory 
-        //   value;
-        // - Handle them properly, by returning the emulated values for the internal addresses, and the external
-        //   values for the external addresses.
+        // - Handle them by reading the actual memory value.
         // bdshemu does not care directly about this, and lets the integrator choose his own strategy.
         if (ND_NULL != Context->AccessMemory)
         {
@@ -401,6 +486,17 @@ ShemuMemStore(
     else
     {
         ND_BOOL res = ND_FALSE;
+
+        // Access isolation: an access that partially overlaps the shellcode or the stack region
+        // (that is, it straddles a region boundary) is not fully inside any emulated region, and
+        // must NOT be delegated to the caller-mapped memory. Reject it with a locatable abort
+        // status, before any side effect (no bytes are written, and the external access counter
+        // is not incremented).
+        if (ShemuOverlapsWindow(Gla, Size, Context->ShellcodeBase, Context->ShellcodeSize) ||
+            ShemuOverlapsWindow(Gla, Size, Context->StackBase, Context->StackSize))
+        {
+            return SHEMU_ABORT_GLA_OUTSIDE;
+        }
 
         // We allow a maximum number of external memory accesses, due to performance reasons.
         if (++Context->ExtMemAccess > Context->MemThreshold)
