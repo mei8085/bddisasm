@@ -249,6 +249,12 @@ if (BDD_LTO)
     endif ()
 endif ()
 
+# Integration tests that use the bdshemu API directly (rather than comparing disasmtool output).
+# Added before disasmtool so that its `test` target can depend on the test executable.
+if ((${CMAKE_PROJECT_NAME} STREQUAL ${PROJECT_NAME}) AND BDD_INCLUDE_TESTS)
+    add_subdirectory(bdshemu_test)
+endif ()
+
 # If this is the master project (and if the user requested it) add disasmtool.
 if ((${CMAKE_PROJECT_NAME} STREQUAL ${PROJECT_NAME}) AND BDD_INCLUDE_TOOL)
     add_subdirectory(disasmtool)

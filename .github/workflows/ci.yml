@@ -49,6 +49,9 @@ jobs:
     - name: Test bdshemu
       if: ${{ matrix.preset != 'no-mnemonic' }}
       run: python3 ./tests/main.py --disasm ./build/${{ matrix.preset }}/disasmtool/disasmtool --conf ./bdshemu_test/conf-x86.json
+    - name: Test bdshemu integration
+      if: ${{ matrix.preset != 'no-mnemonic' }}
+      run: ./build/${{ matrix.preset }}/bdshemu_test/bdshemu_selfmod_test
     - name: Install
       if: ${{ matrix.preset == 'release' }}
       run: |
@@ -187,6 +190,39 @@ jobs:
       run: python3 ./tests/main.py --disasm ./build/disasmtool/disasmtool --conf ./bddisasm_test/conf-x86.json
     - name: Test bdshemu
       run: python3 ./tests/main.py --disasm ./build/disasmtool/disasmtool --conf ./bdshemu_test/conf-x86.json
+
+  # API-level emulator integration tests. They do not go through disasmtool, so they run in a
+  # separate job which sets no external dependencies and exercises sanitizer builds on Linux and
+  # macOS, plus the Windows toolchain.
+  Emulator-integration-tests:
+
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            build-type: Debug
+            sanitizers: "ON"
+          - os: macos-latest
+            build-type: Release
+            sanitizers: "ON"
+          - os: windows-latest
+            build-type: Debug
+            sanitizers: "OFF"
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} -DBDD_INCLUDE_TESTS=ON -DBDD_INCLUDE_TOOL=OFF -DBDD_ASAN=${{ matrix.sanitizers }} -DBDD_UBSAN=${{ matrix.sanitizers }}
+    - name: Build
+      run: cmake --build build --config ${{ matrix.build-type }} --target bdshemu_selfmod_test
+    - name: Run
+      shell: bash
+      run: |
+        exe=$(find build -name "bdshemu_selfmod_test*" -type f | head -n 1)
+        "$exe"
 
   Code-checks:
 

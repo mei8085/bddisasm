@@ -51,3 +51,29 @@ Each entry in the configuration file has the following structure:
 ```
 
 NOTE: The paths in the configuration file are relative to it.
+
+# Emulator Integration Tests
+
+The configuration-driven suite above compares `disasmtool` output against `.result` files, which
+makes the checks depend on the textual disassembly format. Some emulator semantics are better
+verified against the API contract itself:
+
+* `bdshemu_test/integration/selfmod_test.c` - self-modifying code: a store into the emulated
+  shellcode must be visible to later fetches (including modifications that overlap other
+  instructions or straddle instruction boundaries), while out-of-bounds stores must abort with
+  `SHEMU_ABORT_GLA_OUTSIDE` without writing anything outside the shellcode. The test asserts on
+  fetched instruction bytes, executed addresses, registers, counters and abort statuses, never
+  on disassembly text.
+
+This test uses the public `ShemuEmulate` API and raw instruction bytes, is written in C, and is
+built when the project is configured with `-DBDD_INCLUDE_TESTS=ON`. It does not need
+`disasmtool`, so it can also be built on its own:
+
+```console
+$ cmake -B build . -DBDD_INCLUDE_TESTS=ON -DBDD_INCLUDE_TOOL=OFF
+$ cmake --build build --target bdshemu_selfmod_test
+$ ./build/bdshemu_test/bdshemu_selfmod_test
+```
+
+With `-DBDD_INCLUDE_TOOL=ON` (the default) the test is also run by the `test` target, together
+with the two configuration-driven suites.

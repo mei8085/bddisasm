@@ -24,12 +24,16 @@ endif ()
 add_executable(disasmtool disasmtool.c handle_disasm.c handle_shemu.c)
 target_link_libraries(disasmtool PRIVATE bddisasm::bddisasm bddisasm::bdshemu)
 
-# Add tests target.
+# Add tests target. Alongside the result-comparison suites, run the API-level emulator
+# integration tests built by bdshemu_test/CMakeLists.txt (a sibling directory).
 if (BDD_INCLUDE_TESTS)
+    set(BDD_SELFMOD_TEST_TARGET bdshemu_selfmod_test)
+
     add_custom_target(test ALL
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/main.py --conf ${CMAKE_SOURCE_DIR}/bddisasm_test/conf-x86.json --disasm $<TARGET_FILE:disasmtool>
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/main.py --conf ${CMAKE_SOURCE_DIR}/bdshemu_test/conf-x86.json --disasm $<TARGET_FILE:disasmtool>
-        DEPENDS disasmtool
+        COMMAND $<TARGET_FILE:${BDD_SELFMOD_TEST_TARGET}>
+        DEPENDS disasmtool ${BDD_SELFMOD_TEST_TARGET}
         COMMENT "Runs decoder and emulator tests"
     )
 endif ()
