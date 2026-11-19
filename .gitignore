@@ -75,3 +75,4 @@ bindings/pybddisasm/pybddisasm/pybddisasm_wrap.c
 
 bddfuzz.tar
 bindings/pybddisasm/.eggs
+tests/stack_strings/test_stack_strings

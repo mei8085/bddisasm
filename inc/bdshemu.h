@@ -93,6 +93,16 @@ typedef struct _SHEMU_X86_CTX
 
 #define SHEMU_ICACHE_SIZE       0x100
 
+// Largest virtual stack whose every byte can be tracked by the stack-string tracker. Larger stacks are still
+// fully emulated, but dynamic string tracking is silently disabled for them. 32 KiB covers the default 8 KiB
+// emulation stack four times over while keeping the embedded SHEMU_CONTEXT footprint bounded.
+#define SHEMU_STACK_TRACK_MAX_SIZE      0x8000
+
+// Size of the internal, integrator-opaque bookkeeping buffer embedded inside SHEMU_CONTEXT. The tracker state for
+// one stack byte is: one byte of flags plus the address of the writing instruction.
+#define SHEMU_STRING_TRACK_ENTRY_SIZE   (sizeof(ND_UINT8) + sizeof(ND_UINT64))
+#define SHEMU_STRING_TRACK_RESERVED_SIZE (SHEMU_STACK_TRACK_MAX_SIZE * SHEMU_STRING_TRACK_ENTRY_SIZE)
+
 typedef struct SHEMU_ICACHE
 {
     // Instruction cache.
@@ -124,6 +134,58 @@ typedef struct SHEMU_LOOP_TRACK
 } SHEMU_LOOP_TRACK;
 
 
+// Maximum number of distinct dynamically-constructed stack strings reported for a single emulation run.
+#define SHEMU_MAX_STRINGS               16
+
+// Maximum number of bytes (including the terminating NUL, when present) exposed inside a reported stack string.
+// Bytes that cannot be reconstructed are never filled in with printable placeholders.
+#define SHEMU_MAX_STRING_LENGTH         256
+
+
+//
+// Describes a single string dynamically constructed on the stack. Every byte covered by such a string has been
+// written by at least one emulated instruction; the provenance of each byte is tracked, so the reported content
+// never contains guesses.
+//
+// Note that plain constant strings (for example, an immediate string pushed on the stack in a single PUSH) are
+// still reported through the legacy StrLength/SHEMU_FLAG_STACK_STR mechanism and do not require an entry here.
+//
+typedef struct SHEMU_STRING
+{
+    // Start linear address of the string on the stack.
+    ND_UINT64           StartAddress;
+
+    // End linear address of the string on the stack (exclusive). EndAddress - StartAddress is the span of
+    // consecutive reconstructible bytes that belong to the string. A byte that was never written, or whose
+    // provenance cannot be established, always terminates a span, so it is never included here; such a byte is
+    // likewise the first position past ValidLength when it interrupts the printable content.
+    ND_UINT64           EndAddress;
+
+    // Address of the first emulated instruction that wrote a byte belonging to this string.
+    ND_UINT64           SourceStart;
+
+    // Address of the last emulated instruction that wrote a byte belonging to this string. The range
+    // [SourceStart, SourceEnd] covers every instruction that contributed content to the string.
+    ND_UINT64           SourceEnd;
+
+    // Number of consecutive valid (reconstructed) bytes starting at StartAddress. This is the usable length of
+    // the string. Bytes beyond this offset either were never written or their provenance cannot be determined,
+    // and therefore they are left untouched inside Buffer.
+    ND_UINT32           ValidLength;
+
+    // Total span covered by the string (EndAddress - StartAddress), capped to SHEMU_MAX_STRING_LENGTH.
+    ND_UINT32           TotalLength;
+
+    // ND_TRUE if the string is properly terminated by a reconstructed NUL byte right after ValidLength bytes.
+    ND_BOOL             NulTerminated;
+
+    // Reconstructed string bytes. Only the first ValidLength bytes (plus the terminating NUL, when present) are
+    // defined; the rest of the buffer is zeroed and must never be interpreted as content.
+    ND_UINT8            Buffer[SHEMU_MAX_STRING_LENGTH];
+
+} SHEMU_STRING;
+
+
 //
 // Emulation context. All of these fields must be provided as input, although most of them can be 0. 
 //
@@ -144,6 +206,20 @@ typedef struct _SHEMU_CONTEXT
 
     // Tracks emulated loops.
     SHEMU_LOOP_TRACK    LoopTrack;
+
+    // Number of valid entries inside Strings. Should be 0 on input. Each entry describes a string dynamically
+    // constructed on the stack (through consecutive, byte-by-byte or overlapping writes). Plain constant strings
+    // detected through the legacy heuristic do not get an entry here.
+    ND_UINT32           StringsCount;
+
+    // Dynamically constructed strings identified during emulation. Should be zeroed on input. The entries are
+    // valid only after ShemuEmulate returns.
+    SHEMU_STRING        Strings[SHEMU_MAX_STRINGS];
+
+    // Internal bookkeeping used by the stack-string tracker. Must be zeroed on input; must never be inspected or
+    // modified by the integrator. The size is chosen so that stacks up to SHEMU_STACK_TRACK_MAX_SIZE bytes are
+    // tracked byte-for-byte without any heap allocation.
+    ND_UINT8            StringTrackReserved[SHEMU_STRING_TRACK_RESERVED_SIZE];
 
     // The suspicious code to be emulated. Must be provided as input, as follows:
     // - This buffer must be allocated by the caller, and it must be writeable. It should NOT point to process memory,

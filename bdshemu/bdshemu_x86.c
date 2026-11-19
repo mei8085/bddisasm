@@ -62,7 +62,82 @@ typedef struct _SHEMU_VALUE
     } Value;
 
     ND_OPERAND_SIZE     Size;
+
+    //
+    // Value provenance, used exclusively by the stack-string tracker. These fields never influence emulation:
+    // they are carried alongside the value and are consulted only when the value ends up stored on the stack.
+    //
+
+    // ND_TRUE when the value is a constant produced directly by the current instruction (immediate operand,
+    // hard-wired zero/one, etc.) and therefore every byte of it can be safely reconstructed.
+    ND_BOOL             Known;
+
+    // When Known is ND_TRUE, address of the instruction that produced the value.
+    ND_UINT64           Originator;
+
 } SHEMU_VALUE, *PSHEMU_VALUE;
+
+
+//
+// Per-stack-byte provenance flags used by the stack-string tracker.
+//
+enum
+{
+    // The byte has been written at least once by an emulated instruction.
+    STR_TRK_WRITTEN     = 0x01,
+
+    // The current value of the byte is known: it was produced by a constant (immediate/hard-wired) source.
+    STR_TRK_KNOWN       = 0x02,
+};
+
+
+//
+// Internal stack-string tracker state. One entry is maintained per emulated stack byte.
+//
+typedef struct _SHEMU_STR_TRACKER
+{
+    // One flag byte per stack byte (STR_TRK_*).
+    ND_UINT8            *Flags;
+
+    // Packed per-stack-byte origin area (one ND_UINT64 each, accessed through memcpy so no alignment or strict
+    // aliasing requirement is imposed on the integrator's opaque buffer).
+    ND_UINT8            *OriginBytes;
+
+    // Base address and number of tracked bytes. Accesses outside this range are ignored by the tracker.
+    ND_UINT64           StackBase;
+    ND_UINT64           StackSize;
+
+    // ND_TRUE when the tracker is usable for the current emulation run.
+    ND_BOOL             Enabled;
+
+} SHEMU_STR_TRACKER;
+
+
+//
+// Accessors for the packed per-byte origin area.
+//
+static ND_UINT64
+ShemuX86StrOriginGet(
+    const SHEMU_STR_TRACKER *Tracker,
+    ND_UINT64 Index
+    )
+{
+    ND_UINT64 value;
+
+    shemu_memcpy(&value, Tracker->OriginBytes + Index * sizeof(ND_UINT64), sizeof(ND_UINT64));
+    return value;
+}
+
+
+static void
+ShemuX86StrOriginSet(
+    SHEMU_STR_TRACKER *Tracker,
+    ND_UINT64 Index,
+    ND_UINT64 Value
+    )
+{
+    shemu_memcpy(Tracker->OriginBytes + Index * sizeof(ND_UINT64), &Value, sizeof(ND_UINT64));
+}
 
 
 enum
@@ -77,18 +152,20 @@ enum
 
 
 #define GET_OP(ctx, op, val) {                                                                                         \
-    shstatus = ShemuX86GetOperandValue(ctx, op, val);                                                                  \
+    shstatus = ShemuX86GetOperandValue(ctx, &strTracker, op, val);                                                     \
     if (SHEMU_SUCCESS != shstatus)                                                                                     \
     {                                                                                                                  \
-        return shstatus;                                                                                               \
+        emulateStatus = shstatus;                                                                                      \
+        goto emulate_done;                                                                                             \
     }                                                                                                                  \
 }
 
 #define SET_OP(ctx, op, val) {                                                                                         \
-    shstatus = ShemuX86SetOperandValue(ctx, op, val);                                                                  \
+    shstatus = ShemuX86SetOperandValue(ctx, &strTracker, op, val);                                                     \
     if (SHEMU_SUCCESS != shstatus)                                                                                     \
     {                                                                                                                  \
-        return shstatus;                                                                                               \
+        emulateStatus = shstatus;                                                                                      \
+        goto emulate_done;                                                                                             \
     }                                                                                                                  \
 }
 
@@ -96,6 +173,364 @@ enum
 #define SET_FLAG(ctx, flg, val)             ShemuX86SetFlag(ctx, flg, val)
 #define SET_FLAGS(ctx, dst, src1, src2, fm) ShemuX86SetFlags(ctx, dst.Value.Qwords[0], src1.Value.Qwords[0],           \
                                                              src2.Value.Qwords[0], dst.Size, fm)
+
+
+//
+// Stack-string tracker helpers.
+//
+// The tracker maintains, for every emulated stack byte, whether it was written and whether its current value is
+// reconstructible from a constant (immediate/hard-wired) source. The actual stack bytes and the rest of the
+// emulation state are never modified by this machinery; all bookkeeping lives inside the context's opaque
+// StringTrackReserved area.
+//
+
+
+//
+// ShemuX86StrTrackerInit
+//
+static void
+ShemuX86StrTrackerInit(
+    SHEMU_CONTEXT *Context,
+    SHEMU_STR_TRACKER *Tracker
+    )
+{
+    ND_UINT64 entrySize;
+
+    Tracker->Enabled = ND_FALSE;
+    Tracker->Flags = ND_NULL;
+    Tracker->OriginBytes = ND_NULL;
+    Tracker->StackBase = Context->StackBase;
+    Tracker->StackSize = Context->StackSize;
+
+    if (Context->StackSize == 0 || Context->StackSize > SHEMU_STACK_TRACK_MAX_SIZE)
+    {
+        // Too large (or invalid) to track inline; emulation still proceeds normally, just without provenance.
+        return;
+    }
+
+    entrySize = SHEMU_STRING_TRACK_ENTRY_SIZE;
+    if (Context->StackSize * entrySize > SHEMU_STRING_TRACK_RESERVED_SIZE)
+    {
+        return;
+    }
+
+    // The reserved area must be supplied zeroed by the integrator, but do not rely on that.
+    nd_memzero(Context->StringTrackReserved, (ND_SIZET)(Context->StackSize * entrySize));
+
+    Tracker->Flags = Context->StringTrackReserved;
+    Tracker->OriginBytes = Context->StringTrackReserved + Context->StackSize;
+    Tracker->Enabled = ND_TRUE;
+}
+
+
+//
+// ShemuX86StrTrackerDetach
+//
+// Release the tracker's references into the opaque buffer. The collected strings inside SHEMU_CONTEXT are left
+// untouched, so they remain available to the integrator after emulation returns.
+//
+static void
+ShemuX86StrTrackerDetach(
+    SHEMU_STR_TRACKER *Tracker
+    )
+{
+    Tracker->Enabled = ND_FALSE;
+    Tracker->Flags = ND_NULL;
+    Tracker->OriginBytes = ND_NULL;
+}
+
+
+//
+// ShemuX86StrIsPrintable
+//
+// A byte may participate in a reconstructed string only if it is printable. This deliberately mirrors the
+// character set accepted by the legacy stack-string heuristic.
+//
+static ND_BOOL
+ShemuX86StrIsPrintable(
+    ND_UINT8 Value
+    )
+{
+    return ((Value >= 'a' && Value <= 'z') ||
+            (Value >= 'A' && Value <= 'Z') ||
+            (Value >= '0' && Value <= '9') ||
+            Value == '\\' || Value == '/' || Value == ':' || Value == ' ');
+}
+
+
+//
+// ShemuX86StrTrackerRecord
+//
+// Record one stack store performed by the current instruction. Each affected byte is individually marked as
+// written; bytes coming from a known constant source are additionally marked as reconstructible. Overlapping or
+// partial stores naturally overwrite the previous per-byte state.
+//
+static void
+ShemuX86StrTrackerRecord(
+    SHEMU_CONTEXT *Context,
+    SHEMU_STR_TRACKER *Tracker,
+    ND_UINT64 Gla,
+    ND_UINT64 Size,
+    const SHEMU_VALUE *Value
+    )
+{
+    ND_UINT64 offset, i;
+    ND_UINT64 curRip;
+
+    if (!Tracker->Enabled || Size == 0)
+    {
+        return;
+    }
+
+    // Reject accesses that are not fully contained inside the tracked stack window.
+    if (Gla < Tracker->StackBase ||
+        Gla + Size < Gla ||
+        Gla + Size > Tracker->StackBase + Tracker->StackSize)
+    {
+        return;
+    }
+
+    // Address of the instruction performing the store. RIP has already been advanced past the instruction.
+    curRip = Context->Arch.X86.Registers.RegRip - Context->Arch.X86.Instruction.Length;
+    offset = Gla - Tracker->StackBase;
+
+    for (i = 0; i < Size; i++)
+    {
+        ND_UINT64 idx = offset + i;
+
+        Tracker->Flags[idx] |= STR_TRK_WRITTEN;
+        ShemuX86StrOriginSet(Tracker, idx, curRip);
+
+        if (Value->Known && i < Value->Size)
+        {
+            Tracker->Flags[idx] |= STR_TRK_KNOWN;
+        }
+        else
+        {
+            // The byte value cannot be reconstructed (register/memory source, or value larger than the store).
+            // It must never surface as printable content inside a reported string.
+            Tracker->Flags[idx] &= ~STR_TRK_KNOWN;
+        }
+    }
+}
+
+
+//
+// ShemuX86StrTrackerEmit
+//
+// Finalize one candidate string described by a contiguous run of written stack bytes. Only the leading run of
+// known, printable bytes is exposed; any unknown, non-printable or unwritten byte terminates the usable content
+// and is reported through ValidLength rather than being substituted with a placeholder.
+//
+static void
+ShemuX86StrTrackerEmit(
+    SHEMU_CONTEXT *Context,
+    SHEMU_STR_TRACKER *Tracker,
+    ND_UINT64 StartOffset,
+    ND_UINT64 EndOffset
+    )
+{
+    SHEMU_STRING *str;
+    ND_UINT64 i, validLen, span, sourceStart, sourceEnd;
+    ND_UINT8 value;
+
+    if (Context->StringsCount >= SHEMU_MAX_STRINGS)
+    {
+        return;
+    }
+
+    validLen = 0;
+    sourceStart = 0;
+    sourceEnd = 0;
+
+    for (i = StartOffset; i < EndOffset; i++)
+    {
+        if ((Tracker->Flags[i] & (STR_TRK_WRITTEN | STR_TRK_KNOWN)) !=
+            (STR_TRK_WRITTEN | STR_TRK_KNOWN))
+        {
+            break;
+        }
+
+        if (ShemuMemLoad(Context, Tracker->StackBase + i, 1, &value) != SHEMU_SUCCESS)
+        {
+            break;
+        }
+
+        if (!ShemuX86StrIsPrintable(value))
+        {
+            break;
+        }
+
+        if (validLen == 0)
+        {
+            sourceStart = ShemuX86StrOriginGet(Tracker, i);
+        }
+        sourceEnd = ShemuX86StrOriginGet(Tracker, i);
+        validLen++;
+
+        if (validLen >= SHEMU_MAX_STRING_LENGTH - 1)
+        {
+            break;
+        }
+    }
+
+    // The usable string must reach the configured threshold.
+    if (validLen < Context->StrThreshold)
+    {
+        return;
+    }
+
+    // Count the distinct instructions that produced the usable bytes. A string produced entirely by a single
+    // store (for example, one PUSH of an immediate constant) is a plain constant string and keeps using the
+    // legacy StrLength/SHEMU_FLAG_STACK_STR representation; it must not be reported here.
+    {
+        ND_UINT32 distinctOrigins = 0;
+        ND_UINT64 seenOrigins[8];
+        ND_UINT64 j;
+        ND_BOOL seen;
+
+        for (i = 0; i < validLen && distinctOrigins < 2; i++)
+        {
+            ND_UINT64 origin = ShemuX86StrOriginGet(Tracker, StartOffset + i);
+
+            seen = ND_FALSE;
+            for (j = 0; j < distinctOrigins; j++)
+            {
+                if (seenOrigins[j] == origin)
+                {
+                    seen = ND_TRUE;
+                    break;
+                }
+            }
+
+            if (!seen)
+            {
+                if (distinctOrigins < (sizeof(seenOrigins) / sizeof(seenOrigins[0])))
+                {
+                    seenOrigins[distinctOrigins] = origin;
+                }
+                distinctOrigins++;
+            }
+        }
+
+        if (distinctOrigins < 2)
+        {
+            return;
+        }
+    }
+
+    span = EndOffset - StartOffset;
+    if (span > SHEMU_MAX_STRING_LENGTH)
+    {
+        span = SHEMU_MAX_STRING_LENGTH;
+    }
+
+    str = &Context->Strings[Context->StringsCount];
+    str->StartAddress = Tracker->StackBase + StartOffset;
+    str->EndAddress = Tracker->StackBase + StartOffset + span;
+    str->SourceStart = sourceStart;
+    str->SourceEnd = sourceEnd;
+    str->ValidLength = (ND_UINT32)validLen;
+    str->TotalLength = (ND_UINT32)span;
+    str->NulTerminated = ND_FALSE;
+
+    // Only reconstructed bytes are copied into the result buffer; the remaining bytes stay zeroed.
+    for (i = 0; i < validLen; i++)
+    {
+        ShemuMemLoad(Context, str->StartAddress + i, 1, &str->Buffer[i]);
+    }
+
+    // A reconstructed NUL immediately following the usable content makes the string properly terminated.
+    if ((StartOffset + validLen < Tracker->StackSize) &&
+        (Tracker->Flags[StartOffset + validLen] & (STR_TRK_WRITTEN | STR_TRK_KNOWN)) ==
+            (STR_TRK_WRITTEN | STR_TRK_KNOWN) &&
+        ShemuMemLoad(Context, str->StartAddress + validLen, 1, &value) == SHEMU_SUCCESS &&
+        value == 0)
+    {
+        str->NulTerminated = ND_TRUE;
+        if (validLen + 1 < SHEMU_MAX_STRING_LENGTH)
+        {
+            str->Buffer[validLen] = 0;
+        }
+    }
+
+    Context->StringsCount++;
+
+    if (Context->Options & SHEMU_OPT_TRACE_STRINGS)
+    {
+        ND_UINT8 local[SHEMU_MAX_STRING_LENGTH];
+        ND_UINT64 copyLen = validLen;
+
+        nd_memzero(local, sizeof(local));
+        if (copyLen >= sizeof(local))
+        {
+            copyLen = sizeof(local) - 1;
+        }
+        for (i = 0; i < copyLen; i++)
+        {
+            local[i] = str->Buffer[i];
+        }
+
+        shemu_printf(Context,
+                     "        Stack string at 0x%016llx, valid length %llu, span %llu, "
+                     "sources 0x%016llx-0x%016llx, \"%s\"\n",
+                     (unsigned long long)str->StartAddress,
+                     (unsigned long long)str->ValidLength,
+                     (unsigned long long)str->TotalLength,
+                     (unsigned long long)str->SourceStart,
+                     (unsigned long long)str->SourceEnd,
+                     local);
+    }
+}
+
+
+//
+// ShemuX86StrTrackerCollect
+//
+// Walk the tracked stack window and turn maximal runs of fully reconstructible bytes (written AND known) into
+// candidate strings. An unwritten byte, or a written byte whose provenance cannot be established, both act as
+// boundaries, so unknown bytes can never be bridged and a valid string following them is still discovered.
+//
+static void
+ShemuX86StrTrackerCollect(
+    SHEMU_CONTEXT *Context,
+    SHEMU_STR_TRACKER *Tracker
+    )
+{
+    ND_UINT64 i, runStart;
+    ND_BOOL inRun;
+
+    if (!Tracker->Enabled)
+    {
+        return;
+    }
+
+    inRun = ND_FALSE;
+    runStart = 0;
+
+    for (i = 0; i < Tracker->StackSize; i++)
+    {
+        ND_BOOL reconstructible =
+            ((Tracker->Flags[i] & (STR_TRK_WRITTEN | STR_TRK_KNOWN)) ==
+             (STR_TRK_WRITTEN | STR_TRK_KNOWN));
+
+        if (reconstructible && !inRun)
+        {
+            runStart = i;
+            inRun = ND_TRUE;
+        }
+        else if (!reconstructible && inRun)
+        {
+            ShemuX86StrTrackerEmit(Context, Tracker, runStart, i);
+            inRun = ND_FALSE;
+        }
+    }
+
+    if (inRun)
+    {
+        ShemuX86StrTrackerEmit(Context, Tracker, runStart, Tracker->StackSize);
+    }
+}
 
 
 //
@@ -1064,6 +1499,7 @@ ShemuX86ComputeLinearAddress(
 static SHEMU_STATUS
 ShemuX86GetOperandValue(
     SHEMU_CONTEXT *Context,
+    SHEMU_STR_TRACKER *Tracker,
     ND_UINT32 Operand,
     SHEMU_VALUE *Value
     )
@@ -1083,6 +1519,11 @@ ShemuX86GetOperandValue(
     {
         return SHEMU_ABORT_OPERAND_NOT_SUPPORTED;
     }
+
+    // Values read from registers or memory have no intrinsic constant provenance. Specific branches below
+    // (immediates, constants) upgrade this to Known when appropriate.
+    Value->Known = ND_FALSE;
+    Value->Originator = 0;
 
     if (op->Type == ND_OP_REG)
     {
@@ -1242,6 +1683,40 @@ ShemuX86GetOperandValue(
             return status;
         }
 
+        // Propagate provenance for loads from the tracked stack window: the loaded value is reconstructible
+        // only when every loaded byte was itself produced by a known constant store. Loads from the shellcode
+        // or external memory stay unknown, so constant strings read from the code section never get a
+        // reconstructed entry through this path.
+        if (Tracker->Enabled &&
+            gla >= Tracker->StackBase &&
+            gla + Value->Size >= gla &&
+            gla + Value->Size <= Tracker->StackBase + Tracker->StackSize)
+        {
+            ND_UINT64 off = gla - Tracker->StackBase;
+            ND_UINT64 k;
+
+            Value->Known = ND_TRUE;
+            Value->Originator = 0;
+
+            for (k = 0; k < Value->Size; k++)
+            {
+                if ((Tracker->Flags[off + k] & (STR_TRK_WRITTEN | STR_TRK_KNOWN)) !=
+                    (STR_TRK_WRITTEN | STR_TRK_KNOWN))
+                {
+                    Value->Known = ND_FALSE;
+                    Value->Originator = 0;
+                    break;
+                }
+
+                ND_UINT64 origin = ShemuX86StrOriginGet(Tracker, off + k);
+
+                if (Value->Originator == 0 || origin > Value->Originator)
+                {
+                    Value->Originator = origin;
+                }
+            }
+        }
+
         if (Context->Options & SHEMU_OPT_TRACE_MEMORY)
         {
             ShemuDisplayMemValue(Context, gla, Value->Size, Value->Value.Bytes, ND_TRUE);
@@ -1272,10 +1747,18 @@ done_gla:;
     else if (op->Type == ND_OP_IMM)
     {
         Value->Value.Qwords[0] = op->Info.Immediate.Imm;
+
+        // An immediate is a fully reconstructible constant, produced by the current instruction.
+        Value->Known = ND_TRUE;
+        Value->Originator = Context->Arch.X86.Registers.RegRip - Context->Arch.X86.Instruction.Length;
     }
     else if (op->Type == ND_OP_CONST)
     {
         Value->Value.Qwords[0] = op->Info.Constant.Const;
+
+        // Hard-wired constants (e.g. the 1 shifted into a bit) are likewise reconstructible.
+        Value->Known = ND_TRUE;
+        Value->Originator = Context->Arch.X86.Registers.RegRip - Context->Arch.X86.Instruction.Length;
     }
     else if (op->Type == ND_OP_OFFS)
     {
@@ -1296,6 +1779,7 @@ done_gla:;
 static SHEMU_STATUS
 ShemuX86SetOperandValue(
     SHEMU_CONTEXT *Context,
+    SHEMU_STR_TRACKER *Tracker,
     ND_UINT32 Operand,
     SHEMU_VALUE *Value
     )
@@ -1486,6 +1970,10 @@ ShemuX86SetOperandValue(
         {
             return status;
         }
+
+        // Record provenance for every byte actually written to the tracked stack window. This single hook
+        // covers PUSH, MOV to stack, STOS/MOVS string stores and overlapping/partial writes alike.
+        ShemuX86StrTrackerRecord(Context, Tracker, gla, MIN(op->Size, Value->Size), Value);
 
         if (Context->Options & SHEMU_OPT_TRACE_MEMORY)
         {
@@ -1877,6 +2365,8 @@ ShemuX86Emulate(
     ND_BOOL stop = ND_FALSE, cf, sled = ND_TRUE, taken = ND_FALSE;
     ND_UINT16 cs = 0;
     ND_UINT64 tsc = 0x1248fe7a5c30;
+    SHEMU_STR_TRACKER strTracker;
+    SHEMU_STATUS emulateStatus = SHEMU_SUCCESS;
 
     if (ND_NULL == Context)
     {
@@ -1938,6 +2428,14 @@ ShemuX86Emulate(
         Context->StrThreshold = SHEMU_DEFAULT_STR_THRESHOLD;
     }
 
+    // Initialize the stack-string tracker. This never affects emulation semantics: it only maintains separate
+    // per-stack-byte provenance inside the opaque StringTrackReserved area, and starts from a clean state.
+    ShemuX86StrTrackerInit(Context, &strTracker);
+
+    // Never inherit string results from a previous run.
+    Context->StringsCount = 0;
+    nd_memzero(Context->Strings, sizeof(Context->Strings));
+
     decodeCtx.DefCode = Context->Arch.X86.Mode;
     decodeCtx.DefData = Context->Arch.X86.Mode;
     decodeCtx.DefStack = Context->Arch.X86.Mode;
@@ -1970,14 +2468,16 @@ ShemuX86Emulate(
         // If we already have a detection and we wish to stop on detections, do so now.
         if ((0 != Context->Flags) && (0 != (Context->Options & SHEMU_OPT_STOP_ON_EXPLOIT)))
         {
-            return SHEMU_ABORT_SHELLCODE_DETECTED;
+            emulateStatus = SHEMU_ABORT_SHELLCODE_DETECTED;
+            goto emulate_done;
         }
 
         // Make sure the RIP is pointing in the right area. We test only 1 byte - the decoder will make sure it can
         // access as many bytes as needed and return error in case it can't.
         if (!ShemuIsShellcodePtr(Context, Context->Arch.X86.Registers.RegRip, 1))
         {
-            return SHEMU_ABORT_RIP_OUTSIDE;
+            emulateStatus = SHEMU_ABORT_RIP_OUTSIDE;
+            goto emulate_done;
         }
 
         // Get the offset inside the shellcode buffer.
@@ -1990,7 +2490,8 @@ ShemuX86Emulate(
         shstatus = ShemuMemFetch(Context, Context->Arch.X86.Registers.RegRip, ilen, ibytes);
         if (SHEMU_SUCCESS != shstatus)
         {
-            return shstatus;
+            emulateStatus = shstatus;
+            goto emulate_done;
         }
 
         // Decode the next instruction.
@@ -1999,24 +2500,28 @@ ShemuX86Emulate(
         {
             if (ND_STATUS_BUFFER_TOO_SMALL == ndstatus)
             {
-                return SHEMU_ABORT_RIP_OUTSIDE;
+                emulateStatus = SHEMU_ABORT_RIP_OUTSIDE;
+                goto emulate_done;
             }
             else
             {
-                return SHEMU_ABORT_DECODE_ERROR;
+                emulateStatus = SHEMU_ABORT_DECODE_ERROR;
+                goto emulate_done;
             }
         }
 
         shstatus = ShemuX86InstruxChecks(Context);
         if (SHEMU_SUCCESS != shstatus)
         {
-            return shstatus;
+            emulateStatus = shstatus;
+            goto emulate_done;
         }
 
         // Paranoid check...
         if (!ShemuIsShellcodePtr(Context, Context->Arch.X86.Registers.RegRip, Context->Arch.X86.Instruction.Length))
         {
-            return SHEMU_ABORT_RIP_OUTSIDE;
+            emulateStatus = SHEMU_ABORT_RIP_OUTSIDE;
+            goto emulate_done;
         }
 
         // Check if this is a new, unique, address being executed.
@@ -2057,14 +2562,16 @@ ShemuX86Emulate(
         // Bail out early if we encounter a privileged instruction.
         if (Context->Arch.X86.Instruction.ValidModes.Ring3 == 0 && Context->Arch.X86.Ring == 3)
         {
-            return SHEMU_ABORT_NO_PRIVILEGE;
+            emulateStatus = SHEMU_ABORT_NO_PRIVILEGE;
+            goto emulate_done;
         }
 
         // Some instruction types are unssuported.
         if (Context->Arch.X86.Instruction.Category == ND_CAT_IO ||
             Context->Arch.X86.Instruction.Category == ND_CAT_IOSTRINGOP)
         {
-            return SHEMU_ABORT_INSTRUX_NOT_SUPPORTED;
+            emulateStatus = SHEMU_ABORT_INSTRUX_NOT_SUPPORTED;
+            goto emulate_done;
         }
 
         // There are two important aspects of a NOP sled:
@@ -2142,7 +2649,8 @@ ShemuX86Emulate(
         case ND_INS_MOV_CR:
             if (Context->Arch.X86.Ring != 0)
             {
-                return SHEMU_ABORT_NO_PRIVILEGE;
+                emulateStatus = SHEMU_ABORT_NO_PRIVILEGE;
+                goto emulate_done;
             }
 
             // Fall through.
@@ -2188,6 +2696,9 @@ ShemuX86Emulate(
                 src.Size = Context->Arch.X86.Instruction.Operands[0].Size;
                 src.Value.Qwords[0] = 0;
             }
+            // The hard-wired 0/1 result is a reconstructible constant produced by this instruction.
+            src.Known = ND_TRUE;
+            src.Originator = Context->Arch.X86.Registers.RegRip - Context->Arch.X86.Instruction.Length;
             SET_OP(Context, 0, &src);
             break;
 
@@ -2264,6 +2775,18 @@ ShemuX86Emulate(
             if (ND_INS_SBB == Context->Arch.X86.Instruction.Instruction)
             {
                 res.Value.Qwords[0] -= GET_FLAG(Context, NDR_RFLAG_CF);
+            }
+
+            // "sub reg, reg" deterministically produces zero regardless of the prior register contents. SBB is
+            // excluded because it additionally consumes the carry flag.
+            if (ND_INS_SUB == Context->Arch.X86.Instruction.Instruction &&
+                Context->Arch.X86.Instruction.Operands[hasNd ? 1 : 0].Type == ND_OP_REG &&
+                Context->Arch.X86.Instruction.Operands[hasNd ? 2 : 1].Type == ND_OP_REG &&
+                Context->Arch.X86.Instruction.Operands[hasNd ? 1 : 0].Info.Register.Reg ==
+                Context->Arch.X86.Instruction.Operands[hasNd ? 2 : 1].Info.Register.Reg)
+            {
+                res.Known = ND_TRUE;
+                res.Originator = Context->Arch.X86.Registers.RegRip - Context->Arch.X86.Instruction.Length;
             }
 
             SET_FLAGS(Context, res, dst, src, FM_SUB);
@@ -2584,6 +3107,18 @@ ShemuX86Emulate(
             else
             {
                 res.Value.Qwords[0] = dst.Value.Qwords[0] & src.Value.Qwords[0];
+            }
+
+            // "xor reg, reg" (and its EVEX/APX encodings) deterministically produces zero, independent of the
+            // previous register contents, so the result is a reconstructible constant of this instruction.
+            if (ND_INS_XOR == Context->Arch.X86.Instruction.Instruction &&
+                Context->Arch.X86.Instruction.Operands[hasNd ? 1 : 0].Type == ND_OP_REG &&
+                Context->Arch.X86.Instruction.Operands[hasNd ? 2 : 1].Type == ND_OP_REG &&
+                Context->Arch.X86.Instruction.Operands[hasNd ? 1 : 0].Info.Register.Reg ==
+                Context->Arch.X86.Instruction.Operands[hasNd ? 2 : 1].Info.Register.Reg)
+            {
+                res.Known = ND_TRUE;
+                res.Originator = Context->Arch.X86.Registers.RegRip - Context->Arch.X86.Instruction.Length;
             }
 
             if (ND_INS_TEST != Context->Arch.X86.Instruction.Instruction)
@@ -3195,7 +3730,8 @@ check_far_branch:
         case ND_INS_STI:
             if (Context->Arch.X86.Ring != 0)
             {
-                return SHEMU_ABORT_NO_PRIVILEGE;
+                emulateStatus = SHEMU_ABORT_NO_PRIVILEGE;
+                goto emulate_done;
             }
 
             SET_FLAG(Context, NDR_RFLAG_IF, 1);
@@ -3204,7 +3740,8 @@ check_far_branch:
         case ND_INS_CLI:
             if (Context->Arch.X86.Ring != 0)
             {
-                return SHEMU_ABORT_NO_PRIVILEGE;
+                emulateStatus = SHEMU_ABORT_NO_PRIVILEGE;
+                goto emulate_done;
             }
 
             SET_FLAG(Context, NDR_RFLAG_IF, 0);
@@ -3641,7 +4178,8 @@ check_far_branch:
         case ND_INS_SWAPGS:
             if (Context->Arch.X86.Ring != 0)
             {
-                return SHEMU_ABORT_NO_PRIVILEGE;
+                emulateStatus = SHEMU_ABORT_NO_PRIVILEGE;
+                goto emulate_done;
             }
 
             Context->Flags |= SHEMU_FLAG_SWAPGS;
@@ -3651,7 +4189,8 @@ check_far_branch:
         case ND_INS_RDMSR:
             if (Context->Arch.X86.Ring != 0)
             {
-                return SHEMU_ABORT_NO_PRIVILEGE;
+                emulateStatus = SHEMU_ABORT_NO_PRIVILEGE;
+                goto emulate_done;
             }
 
             // Fetch ECX value.
@@ -3669,7 +4208,8 @@ check_far_branch:
         case ND_INS_WRMSR:
             if (Context->Arch.X86.Ring != 0)
             {
-                return SHEMU_ABORT_NO_PRIVILEGE;
+                emulateStatus = SHEMU_ABORT_NO_PRIVILEGE;
+                goto emulate_done;
             }
 
             // Fetch ECX value.
@@ -3758,7 +4298,8 @@ check_far_branch:
             break;
 
         default:
-            return SHEMU_ABORT_INSTRUX_NOT_SUPPORTED;
+            emulateStatus = SHEMU_ABORT_INSTRUX_NOT_SUPPORTED;
+            goto emulate_done;
 
             break;
         }
@@ -3768,18 +4309,28 @@ post_emulate:
         // emulated (for example, SYSCALL, INT, system instructions, etc).
         if (stop)
         {
-            return SHEMU_ABORT_CANT_EMULATE;
+            emulateStatus = SHEMU_ABORT_CANT_EMULATE;
+            goto emulate_done;
         }
     }
 
-    // Minimum percent of the instructions were NOPs => consider we have a NOP sled. Note that we get here only if
-    // the maximum number of instructions has been emulated successfully; if the emulation is aborted for any reason,
-    // this code will have no effect.
-    if ((Context->InstructionsCount >= Context->MaxInstructionsCount / 2) && 
+emulate_done:
+    // Minimum percent of the instructions were NOPs => consider we have a NOP sled. Note that this is evaluated
+    // only on a clean, budget-exhausted emulation run; an aborted run keeps its original status.
+    if (emulateStatus == SHEMU_SUCCESS &&
+        (Context->InstructionsCount >= Context->MaxInstructionsCount / 2) &&
         (Context->NopCount >= Context->InstructionsCount * Context->NopThreshold / 100))
     {
         Context->Flags |= SHEMU_FLAG_NOP_SLED;
     }
 
-    return SHEMU_SUCCESS;
+    // Collect dynamically constructed stack strings. This runs on every exit path, including aborted runs, and
+    // only reads the separate provenance bookkeeping; it cannot alter register/memory emulation state.
+    ShemuX86StrTrackerCollect(Context, &strTracker);
+
+    // Detach the tracker from the opaque buffer so no stale pointer escapes the emulation run. The collected
+    // string results stay available in Context->Strings.
+    ShemuX86StrTrackerDetach(&strTracker);
+
+    return emulateStatus;
 }

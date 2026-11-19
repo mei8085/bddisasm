@@ -282,6 +282,34 @@ handle_shemu(
         }
     }
 
+    // Report every dynamically constructed stack string. Only reconstructed bytes are ever printed; bytes
+    // whose provenance could not be established are reported through ValidLength/TotalLength instead.
+    for (uint32_t si = 0; si < ctx.StringsCount; si++)
+    {
+        SHEMU_STRING const *str = &ctx.Strings[si];
+        char local[SHEMU_MAX_STRING_LENGTH];
+        size_t copyLen = str->ValidLength;
+
+        memset(local, 0, sizeof(local));
+        if (copyLen >= sizeof(local))
+        {
+            copyLen = sizeof(local) - 1;
+        }
+        memcpy(local, str->Buffer, copyLen);
+
+        printf("        Stack string #%u: 0x%016llx-0x%016llx, valid %u of %u bytes%s, "
+               "sources 0x%016llx-0x%016llx, \"%s\"\n",
+               si,
+               (unsigned long long)str->StartAddress,
+               (unsigned long long)str->EndAddress,
+               str->ValidLength,
+               str->TotalLength,
+               str->NulTerminated ? " (NUL)" : "",
+               (unsigned long long)str->SourceStart,
+               (unsigned long long)str->SourceEnd,
+               local);
+    }
+
     if (Options->OutputName != NULL)
     {
         size_t outSize;

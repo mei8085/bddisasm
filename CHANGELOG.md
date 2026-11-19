@@ -4,6 +4,24 @@ All notable (user-facing) changes to this project will be documented in this fil
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+- bdshemu: per-byte provenance tracking for strings dynamically constructed on the stack. Consecutive,
+  byte-by-byte, overlapping and partially-overlapping stores now yield deterministic start/end addresses,
+  the contributing instruction-address range and a valid length, exposed through the new `SHEMU_STRING`
+  array (`Strings`/`StringsCount`) in `SHEMU_CONTEXT`. Bytes whose value cannot be reconstructed are never
+  substituted with printable placeholders, and the tracking bookkeeping is kept fully separate from the
+  emulated register/memory state.
+- bdshemu: `SHEMU_OPT_TRACE_STRINGS` now also logs each reconstructed stack string with its bounds and
+  source-instruction range.
+
+### Changed
+- bdshemu: plain constant strings produced by a single store (for example one immediate `PUSH`) keep using the
+  existing `SHEMU_FLAG_STACK_STR`/`StrLength` representation; only strings assembled by multiple instructions
+  are reported through the new `SHEMU_STRING` results.
+- disasmtool: prints the reconstructed stack strings after the emulation flag summary.
+
 ## [3.1.2] - 2026-11-03
 
 ### Changed
