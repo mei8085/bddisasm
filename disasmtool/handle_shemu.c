@@ -282,6 +282,20 @@ handle_shemu(
         }
     }
 
+    // Print TEB/PEB access information, if any such access has been detected.
+    if (ctx.TibAccessCount > 0)
+    {
+        static const char* const tibKinds[] = { "NONE", "DIRECT", "INDIRECT" };
+        static const char* const tibSources[] = { "NONE", "TEB", "PEB" };
+
+        printf("        TEB/PEB accesses: %llu, last: %s %s access, segment 0x%02x, size %u, gla 0x%016llx, offset 0x%llx\n",
+               (unsigned long long)ctx.TibAccessCount,
+               ctx.TibAccess.Kind < ARRAYSIZE(tibKinds) ? tibKinds[ctx.TibAccess.Kind] : "?",
+               ctx.TibAccess.Source < ARRAYSIZE(tibSources) ? tibSources[ctx.TibAccess.Source] : "?",
+               ctx.TibAccess.Segment, ctx.TibAccess.Size,
+               (unsigned long long)ctx.TibAccess.Gla, (unsigned long long)ctx.TibAccess.Offset);
+    }
+
     if (Options->OutputName != NULL)
     {
         size_t outSize;

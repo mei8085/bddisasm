@@ -1042,3 +1042,77 @@ NdGetMnemonicMini(
     return NdIdbeGetMnemonic(pIdbe->Mnemonic);
 }
 #endif
+
+//
+// NdGetTibAccess
+//
+NDSTATUS
+NdGetTibAccess(
+    const INSTRUX *Instrux,
+    ND_TIB_ACCESS *Access
+)
+{
+    ND_UINT32 i;
+
+    // pre-init
+    i = 0;
+
+    // validate
+    if (ND_NULL == Instrux)
+    {
+        return ND_STATUS_INVALID_PARAMETER;
+    }
+
+    if (ND_NULL == Access)
+    {
+        return ND_STATUS_INVALID_PARAMETER;
+    }
+
+    nd_memzero(Access, sizeof(*Access));
+    Access->Type = ND_TIB_ACCESS_NONE;
+
+    for (i = 0; i < Instrux->OperandsCount; i++)
+    {
+        const ND_OPERAND *pOp = &Instrux->Operands[i];
+
+        if (ND_OP_MEM != pOp->Type)
+        {
+            continue;
+        }
+
+        // Only explicit FS/GS segment addressing is considered a TEB relative access. Regular accesses
+        // (which use the default DS/SS segments) can not be statically attributed to the TEB.
+        if (!pOp->Info.Memory.HasSeg)
+        {
+            continue;
+        }
+
+        if (pOp->Info.Memory.Seg != NDR_FS && pOp->Info.Memory.Seg != NDR_GS)
+        {
+            continue;
+        }
+
+        // An explicit FS/GS segment is used, so the access is relative to the current TEB. Note that this
+        // classification is mode independent, and therefore consistent between 32 bit, 64 bit and
+        // compatibility mode: the FS segment is used to address the 32 bit TEB, while the GS segment is
+        // used to address the 64 bit TEB (32 bit code running in compatibility mode may use GS to access
+        // the 64 bit TEB, while 64 bit code may use FS to access the 32 bit TEB of a WOW64 process).
+        Access->Type = ND_TIB_ACCESS_TEB;
+        Access->Segment = pOp->Info.Memory.Seg;
+        Access->Size = (ND_UINT8)pOp->Size;
+        Access->Offset = (ND_UINT32)pOp->Info.Memory.Disp;
+
+        // The PEB pointer is located at a well-known offset inside the TEB: 0x30 inside the 32 bit TEB
+        // (addressed via the FS segment), and 0x60 inside the 64 bit TEB (addressed via the GS segment).
+        if ((pOp->Info.Memory.Seg == NDR_FS && pOp->Info.Memory.Disp == 0x30) ||
+            (pOp->Info.Memory.Seg == NDR_GS && pOp->Info.Memory.Disp == 0x60))
+        {
+            Access->Type = ND_TIB_ACCESS_PEB;
+        }
+
+        // The first explicit FS/GS relative memory operand wins.
+        break;
+    }
+
+    return ND_STATUS_SUCCESS;
+}

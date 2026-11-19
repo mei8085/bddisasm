@@ -733,5 +733,40 @@
         "f_test": "x86/basic_apx/test_64_apx04.test",
         "options": "-b64 -skipdecoded",
         "command": "shemu"
+    },
+    {
+        "f_source": "x86/basic/test_32_tib01.asm",
+        "f_result": "x86/basic/test_32_tib01.result",
+        "f_test": "x86/basic/test_32_tib01.test",
+        "options": "-b32 -skipdecoded",
+        "command": "shemu"
+    },
+    {
+        "f_source": "x86/basic/test_32_tib02.asm",
+        "f_result": "x86/basic/test_32_tib02.result",
+        "f_test": "x86/basic/test_32_tib02.test",
+        "options": "-b32 -skipdecoded",
+        "command": "shemu"
+    },
+    {
+        "f_source": "x86/basic/test_32_tib03.asm",
+        "f_result": "x86/basic/test_32_tib03.result",
+        "f_test": "x86/basic/test_32_tib03.test",
+        "options": "-b32 -skipdecoded",
+        "command": "shemu"
+    },
+    {
+        "f_source": "x86/basic/test_64_tib01.asm",
+        "f_result": "x86/basic/test_64_tib01.result",
+        "f_test": "x86/basic/test_64_tib01.test",
+        "options": "-b64 -skipdecoded",
+        "command": "shemu"
+    },
+    {
+        "f_source": "x86/basic/test_64_tib02.asm",
+        "f_result": "x86/basic/test_64_tib02.result",
+        "f_test": "x86/basic/test_64_tib02.test",
+        "options": "-b64 -skipdecoded",
+        "command": "shemu"
     }
 ]

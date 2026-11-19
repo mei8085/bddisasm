@@ -4,6 +4,21 @@ All notable (user-facing) changes to this project will be documented in this fil
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+- bddisasm: added the `NdGetTibAccess` helper API, which statically locates TEB/PEB relative accesses made via
+  explicit FS/GS segment addressing (for example, `mov eax, fs:[0x30]`). The result distinguishes accesses to the
+  current TEB from accesses to the PEB pointer inside it, and preserves the source (segment register and offset
+  inside the TEB) and the length of the access. The classification is mode independent, so 32-bit, 64-bit and
+  compatibility mode accesses are handled consistently.
+- bdshemu: added TEB/PEB indirect access tracking. Memory accesses are now classified as direct (explicit segment
+  register addressing), indirect (a register holding a TEB/PEB value is dereferenced) or ordinary (the source can
+  not be determined). Direct and indirect accesses are recorded inside the new `TibAccess` field of the
+  `SHEMU_CONTEXT` structure (together with the `TibAccessCount` counter), preserving the kind, source and length
+  of each access. This detection does not change the decoding or the emulation state of any instruction.
+
+
 ## [3.1.2] - 2026-11-03
 
 ### Changed

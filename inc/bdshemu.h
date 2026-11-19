@@ -78,9 +78,18 @@ typedef struct _SHEMU_X86_CTX
     // SSE registers state. 32 x 64 bytes = 2048 bytes for the SSE registers. Can be provided on input, if needed.
     ND_UINT8            SseRegisters[SHEMU_X86_SSE_REG_COUNT][SHEMU_X86_SSE_REG_SIZE];
 
-    // General purpose registers write bitmap. After the first write, a register will be marked dirty in here. 
+    // General purpose registers write bitmap. After the first write, a register will be marked dirty in here.
     // Should be 0 on input.
     ND_UINT8            GprTracker[SHEMU_X86_GPR_REG_COUNT];
+
+    // TEB/PEB value tracker. For each GPR, indicates whether its value has been loaded from the TEB or the
+    // PEB, either directly, or indirectly, via register transfers. Holds one of the ND_TIB_ACCESS_TYPE
+    // values for each GPR. Should be 0 on input.
+    ND_UINT8            TibTracker[SHEMU_X86_GPR_REG_COUNT];
+
+    // Internal use. Scratch field holding the TEB/PEB taint of the last value loaded by the current
+    // instruction. Should be 0 on input.
+    ND_UINT8            TibLoad;
 
     // Operating mode (ND_CODE_16, ND_CODE_32 or ND_CODE_64). Must be provided as input.
     ND_UINT8            Mode;
@@ -122,6 +131,49 @@ typedef struct SHEMU_LOOP_TRACK
     ND_BOOL             Active;
 
 } SHEMU_LOOP_TRACK;
+
+
+//
+// TEB/PEB access kinds. Describes the way a TEB/PEB relative memory access is carried out.
+//
+typedef enum _SHEMU_TIB_ACCESS_KIND
+{
+    // Ordinary memory access; the source of the accessed address can not be determined.
+    SHEMU_TIB_KIND_NONE = 0,
+
+    // Explicit segment register addressing - for example, "mov eax, fs:[0x30]".
+    SHEMU_TIB_KIND_DIRECT,
+
+    // Register transfer, followed by dereference - for example, "mov eax, fs:[0x30]", followed
+    // by "mov ecx, [eax]". The register holds a value previously loaded from the TEB/PEB.
+    SHEMU_TIB_KIND_INDIRECT,
+} SHEMU_TIB_ACCESS_KIND;
+
+
+//
+// TEB/PEB access information. Describes a single TEB/PEB relative memory access detected during emulation.
+//
+typedef struct _SHEMU_TIB_ACCESS
+{
+    // The way the access is carried out - one of the SHEMU_TIB_ACCESS_KIND values.
+    ND_UINT8    Kind;
+
+    // What is being accessed - one of the ND_TIB_ACCESS_TYPE values (ND_TIB_ACCESS_TEB or ND_TIB_ACCESS_PEB).
+    ND_UINT8    Source;
+
+    // The segment register used for the access - NDR_FS or NDR_GS. 0xFF if the access does not use an
+    // explicit FS/GS segment (possible for indirect accesses).
+    ND_UINT8    Segment;
+
+    // The access size, in bytes.
+    ND_UINT8    Size;
+
+    // The linear address being accessed.
+    ND_UINT64   Gla;
+
+    // The offset inside the TEB. Valid only if the accessed address is inside the TEB; 0 otherwise.
+    ND_UINT64   Offset;
+} SHEMU_TIB_ACCESS, *PSHEMU_TIB_ACCESS;
 
 
 //
@@ -249,6 +301,13 @@ typedef struct _SHEMU_CONTEXT
 
     // Optional context to be passed to Log. Can be NULL.
     void                *LogContext;
+
+    // Number of TEB/PEB accesses (both direct and indirect) detected during emulation. Should be 0 on input.
+    ND_UINT64           TibAccessCount;
+
+    // Information about the last TEB/PEB access detected during emulation. Will be filled in on output if
+    // at least one such access has been detected (see TibAccessCount). Should be zeroed on input.
+    SHEMU_TIB_ACCESS    TibAccess;
 
 } SHEMU_CONTEXT, *PSHEMU_CONTEXT;
 

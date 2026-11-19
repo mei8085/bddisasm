@@ -1057,6 +1057,241 @@ ShemuX86ComputeLinearAddress(
 }
 
 
+//
+// The maximum size of the TEB. The 64 bit TEB is roughly 0x1800 bytes in size; round up to 0x2000.
+//
+#define SHEMU_TEB_MAX_SIZE      0x2000
+
+
+//
+// ShemuX86ClassifyTibAccess
+//
+// Classifies a memory access with respect to the TEB/PEB. Three classes of accesses are distinguished:
+// - direct accesses, which use explicit segment register addressing (for example, "mov eax, fs:[0x30]");
+// - indirect accesses, where a register holding a TEB/PEB value (loaded via a previous direct access, and
+//   possibly transferred between registers) is dereferenced (for example, "mov eax, fs:[0x30]", followed
+//   by "mov ecx, [eax]");
+// - ordinary accesses, whose source can not be determined.
+// Returns the TEB/PEB source of the access (one of the ND_TIB_ACCESS_TYPE values), or ND_TIB_ACCESS_NONE
+// if the access is an ordinary memory access. If Kind is not ND_NULL, it will receive one of the
+// SHEMU_TIB_ACCESS_KIND values.
+//
+static ND_UINT8
+ShemuX86ClassifyTibAccess(
+    SHEMU_CONTEXT *Context,
+    PND_OPERAND Operand,
+    ND_UINT64 Gla,
+    ND_UINT8 *Kind
+    )
+{
+    if (ND_NULL != Kind)
+    {
+        *Kind = SHEMU_TIB_KIND_NONE;
+    }
+
+    // TEB/PEB accesses are tracked for user-mode code only, and only if a valid TIB base has been provided.
+    if (Context->Arch.X86.Ring != 3 || 0 == Context->TibBase)
+    {
+        return ND_TIB_ACCESS_NONE;
+    }
+
+    // Check for a direct access first: explicit FS/GS segment addressing inside the TEB. Note that this
+    // classification is mode independent, and therefore consistent between 32 bit, 64 bit and compatibility
+    // mode: the FS segment addresses the 32 bit TEB, while the GS segment addresses the 64 bit TEB (32 bit
+    // code running in compatibility mode may use GS to access the 64 bit TEB).
+    if (Operand->Info.Memory.HasSeg &&
+        (Operand->Info.Memory.Seg == NDR_FS || Operand->Info.Memory.Seg == NDR_GS) &&
+        (Gla >= Context->TibBase) && (Gla - Context->TibBase < SHEMU_TEB_MAX_SIZE))
+    {
+        ND_UINT64 offset = Gla - Context->TibBase;
+
+        // The PEB pointer is located at offset 0x30 inside the 32 bit TEB (addressed via the FS segment),
+        // and at offset 0x60 inside the 64 bit TEB (addressed via the GS segment).
+        if (ND_NULL != Kind)
+        {
+            *Kind = SHEMU_TIB_KIND_DIRECT;
+        }
+
+        if ((Operand->Info.Memory.Seg == NDR_FS && offset == 0x30) ||
+            (Operand->Info.Memory.Seg == NDR_GS && offset == 0x60))
+        {
+            return ND_TIB_ACCESS_PEB;
+        }
+
+        return ND_TIB_ACCESS_TEB;
+    }
+
+    // Check for an indirect access: a register holding a TEB/PEB value (loaded via a previous direct
+    // access) is dereferenced.
+    if (Operand->Info.Memory.HasBase &&
+        ND_TIB_ACCESS_NONE != Context->Arch.X86.TibTracker[Operand->Info.Memory.Base])
+    {
+        if (ND_NULL != Kind)
+        {
+            *Kind = SHEMU_TIB_KIND_INDIRECT;
+        }
+
+        return Context->Arch.X86.TibTracker[Operand->Info.Memory.Base];
+    }
+
+    if (Operand->Info.Memory.HasIndex &&
+        ND_TIB_ACCESS_NONE != Context->Arch.X86.TibTracker[Operand->Info.Memory.Index])
+    {
+        if (ND_NULL != Kind)
+        {
+            *Kind = SHEMU_TIB_KIND_INDIRECT;
+        }
+
+        return Context->Arch.X86.TibTracker[Operand->Info.Memory.Index];
+    }
+
+    // Ordinary memory access, the source can not be determined.
+    return ND_TIB_ACCESS_NONE;
+}
+
+
+//
+// ShemuX86TrackTibAccess
+//
+// Records a TEB/PEB access inside the context, preserving its kind, source and length. Ordinary memory
+// accesses (whose source can not be determined) are not recorded. Returns the TEB/PEB source of the access,
+// or ND_TIB_ACCESS_NONE for ordinary memory accesses.
+//
+static ND_UINT8
+ShemuX86TrackTibAccess(
+    SHEMU_CONTEXT *Context,
+    PND_OPERAND Operand,
+    ND_UINT64 Gla
+    )
+{
+    ND_UINT8 source, kind;
+
+    source = ShemuX86ClassifyTibAccess(Context, Operand, Gla, &kind);
+    if (ND_TIB_ACCESS_NONE == source)
+    {
+        return ND_TIB_ACCESS_NONE;
+    }
+
+    Context->TibAccessCount++;
+
+    Context->TibAccess.Kind = kind;
+    Context->TibAccess.Source = source;
+    Context->TibAccess.Segment = (Operand->Info.Memory.HasSeg &&
+                                  (Operand->Info.Memory.Seg == NDR_FS || Operand->Info.Memory.Seg == NDR_GS)) ?
+                                 Operand->Info.Memory.Seg : 0xFF;
+    Context->TibAccess.Size = (ND_UINT8)Operand->Size;
+    Context->TibAccess.Gla = Gla;
+    Context->TibAccess.Offset = ((Gla >= Context->TibBase) && (Gla - Context->TibBase < SHEMU_TEB_MAX_SIZE)) ?
+                                Gla - Context->TibBase : 0;
+
+    return source;
+}
+
+
+//
+// ShemuX86UpdateTibTracker
+//
+// Updates the TEB/PEB value tracker after an instruction has been emulated. Values loaded from the TEB/PEB
+// (either directly, or indirectly, via registers holding TEB/PEB values) taint the general purpose registers
+// they are transferred to; any other write to a GPR clears its taint. Note that this does not change the
+// emulation state in any way - it is used only to detect indirect TEB/PEB accesses made by subsequent
+// instructions.
+//
+static void
+ShemuX86UpdateTibTracker(
+    SHEMU_CONTEXT *Context
+    )
+{
+    PINSTRUX instrux = &Context->Arch.X86.Instruction;
+    ND_UINT8 taint;
+    ND_UINT32 i;
+
+    // The TEB/PEB taint of the value loaded by the current instruction, if any.
+    taint = Context->Arch.X86.TibLoad;
+
+    // If no TEB/PEB value has been loaded from memory, check if any of the source registers holds one.
+    // This handles register to register transfers (for example, "mov eax, ebx", where EBX holds a TEB value).
+    if (ND_TIB_ACCESS_NONE == taint)
+    {
+        for (i = 0; i < instrux->OperandsCount; i++)
+        {
+            PND_OPERAND op = &instrux->Operands[i];
+
+            if (0 == (op->Access.Access & ND_ACCESS_ANY_READ))
+            {
+                continue;
+            }
+
+            if (op->Type == ND_OP_REG && op->Info.Register.Type == ND_REG_GPR)
+            {
+                taint = Context->Arch.X86.TibTracker[op->Info.Register.Reg];
+            }
+            else if (op->Type == ND_OP_MEM)
+            {
+                if (op->Info.Memory.HasBase)
+                {
+                    taint = Context->Arch.X86.TibTracker[op->Info.Memory.Base];
+                }
+
+                if (ND_TIB_ACCESS_NONE == taint && op->Info.Memory.HasIndex)
+                {
+                    taint = Context->Arch.X86.TibTracker[op->Info.Memory.Index];
+                }
+            }
+            else
+            {
+                continue;
+            }
+
+            if (ND_TIB_ACCESS_NONE != taint)
+            {
+                break;
+            }
+        }
+    }
+
+    // Zeroing idioms (XOR/SUB reg, reg) clear any TEB/PEB taint.
+    if ((instrux->Instruction == ND_INS_XOR || instrux->Instruction == ND_INS_SUB) &&
+        instrux->OperandsCount >= 2 &&
+        instrux->Operands[0].Type == ND_OP_REG &&
+        instrux->Operands[1].Type == ND_OP_REG &&
+        instrux->Operands[0].Info.Register.Type == ND_REG_GPR &&
+        instrux->Operands[1].Info.Register.Type == ND_REG_GPR &&
+        instrux->Operands[0].Info.Register.Reg == instrux->Operands[1].Info.Register.Reg)
+    {
+        taint = ND_TIB_ACCESS_NONE;
+    }
+
+    // Propagate the taint to all the written general purpose registers.
+    for (i = 0; i < instrux->OperandsCount; i++)
+    {
+        PND_OPERAND op = &instrux->Operands[i];
+
+        if (op->Type != ND_OP_REG || op->Info.Register.Type != ND_REG_GPR)
+        {
+            continue;
+        }
+
+        if (0 == (op->Access.Access & ND_ACCESS_ANY_WRITE))
+        {
+            continue;
+        }
+
+        // Never taint the stack pointer: it is implicitly updated by every stack operation, and tainting it
+        // would cause all subsequent stack accesses to be reported as indirect TEB/PEB accesses.
+        if (op->Info.Register.Reg == NDR_RSP)
+        {
+            continue;
+        }
+
+        Context->Arch.X86.TibTracker[op->Info.Register.Reg] = taint;
+    }
+
+    // Reset the per-instruction scratch.
+    Context->Arch.X86.TibLoad = ND_TIB_ACCESS_NONE;
+}
+
+
 
 //
 // ShemuX86GetOperandValue
@@ -1151,6 +1386,11 @@ ShemuX86GetOperandValue(
         {
             // Address generation instruction, the result is the linear address itself.
             Value->Value.Qwords[0] = gla;
+
+            // No memory access is made, but if the generated address is a TEB/PEB address, the loaded
+            // value is a TEB/PEB value.
+            Context->Arch.X86.TibLoad = ShemuX86ClassifyTibAccess(Context, op, gla, ND_NULL);
+
             goto done_gla;
         }
 
@@ -1234,6 +1474,9 @@ ShemuX86GetOperandValue(
                 Context->Flags |= SHEMU_FLAG_LOAD_RIP;
             }
         }
+
+        // Track TEB/PEB accesses, and taint the loaded value if it comes from the TEB or the PEB.
+        Context->Arch.X86.TibLoad = ShemuX86TrackTibAccess(Context, op, gla);
 
         // Get the memory value.
         status = ShemuMemLoad(Context, gla, Value->Size, Value->Value.Bytes);
@@ -1441,6 +1684,9 @@ ShemuX86SetOperandValue(
     {
         // Compute the GLA.
         ND_UINT64 gla = ShemuX86ComputeLinearAddress(Context, op);
+
+        // Track TEB/PEB accesses. Note that stores do not taint the loaded value scratch.
+        ShemuX86TrackTibAccess(Context, op, gla);
 
         // Handle self-write. We store a 1 for each written byte inside the shellcode space. Once the modified bytes
         // are executed, we can trigger the self-write detection.
@@ -3764,6 +4010,11 @@ check_far_branch:
         }
 
 post_emulate:
+        // Update the TEB/PEB value tracker, now that the instruction has been emulated. Note that this only
+        // affects the detection of indirect TEB/PEB accesses made by subsequent instructions - it does not
+        // change the emulation state in any way.
+        ShemuX86UpdateTibTracker(Context);
+
         // The stop flag has been set, this means we've reached a valid instruction, but that instruction cannot be
         // emulated (for example, SYSCALL, INT, system instructions, etc).
         if (stop)

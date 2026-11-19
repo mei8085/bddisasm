@@ -87,6 +87,30 @@ NdIsInstruxRipRelative(
 );
 
 //
+// TEB/PEB access types. Describes what a TEB/PEB relative memory access targets.
+//
+typedef enum _ND_TIB_ACCESS_TYPE
+{
+    ND_TIB_ACCESS_NONE = 0,     // Not a TEB/PEB access, or the source of the access can not be determined.
+    ND_TIB_ACCESS_TEB,          // The access targets the current Thread Environment Block.
+    ND_TIB_ACCESS_PEB,          // The access targets the Process Environment Block pointer inside the TEB.
+} ND_TIB_ACCESS_TYPE;
+
+
+//
+// TEB/PEB access information, as statically determined from a decoded instruction.
+//
+typedef struct _ND_TIB_ACCESS
+{
+    ND_UINT8    Type;       // One of the ND_TIB_ACCESS_TYPE values.
+    ND_UINT8    Segment;    // The segment register used for the access - NDR_FS or NDR_GS.
+    ND_UINT8    Size;       // The access size, in bytes.
+    ND_UINT8    Reserved;   // Reserved for future use.
+    ND_UINT32   Offset;     // The offset inside the TEB.
+} ND_TIB_ACCESS;
+
+
+//
 // Returns an access map that contains the access for each register.
 //
 NDSTATUS
@@ -102,6 +126,20 @@ NDSTATUS
 NdGetOperandRlut(
     const INSTRUX *Instrux,
     ND_OPERAND_RLUT *Rlut
+);
+
+//
+// Locates TEB/PEB relative accesses. If the instruction contains a memory operand that uses explicit FS/GS
+// segment addressing (for example, "mov eax, fs:[0x30]"), this function fills in Access with information
+// about what is being accessed (the current TEB or the PEB pointer inside it), the source of the access
+// (the segment register and the offset inside the TEB) and the access length. If no such operand is found,
+// Access->Type will be ND_TIB_ACCESS_NONE. Note that this is a static classification: accesses made via
+// values previously loaded from the TEB/PEB into registers can not be determined here.
+//
+NDSTATUS
+NdGetTibAccess(
+    const INSTRUX *Instrux,
+    ND_TIB_ACCESS *Access
 );
 
 #endif // BDX86_API_LEGACY_H
